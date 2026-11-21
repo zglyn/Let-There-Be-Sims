@@ -1,0 +1,6 @@
+{
+  "name": "Sim2Real Compiler",
+  "description": "Sim-to-Real Robotics Failure-to-Policy Compiler with QR-paired smartphone capture, Gemini 4 multi-model orchestration, interactive 3D SO-ARM101 replay, and 20-environment physics verification.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,90 @@
+/*
+ * Global Stylesheet — Precision Lab Dark Design System
+ *
+ * This stylesheet configures Tailwind CSS v4 along with semantic CSS custom
+ * properties, font family bindings (Chakra Petch display, IBM Plex Sans body,
+ * JetBrains Mono telemetry/code), tabular numeral enforcement, subtle hairline
+ * scrollbars, and reduced-motion accessibility guards.
+ *
+ * Use cases:
+ * - Desktop Robotics Command Center with 60-30-10 Precision Lab Dark palette.
+ * - High-contrast mobile camera capture route with >=44px touch ergonomics.
+ * - Synchronized tabular numeric alignment in 20-environment matrices and charts.
+ */
+
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Chakra Petch", sans-serif;
+  --font-sans: "IBM Plex Sans", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --color-lab-canvas: #07090e;
+  --color-lab-recess: #0b0e17;
+  --color-lab-surface: #111622;
+  --color-lab-elevated: #161d2c;
+  --color-lab-border: #1e293b;
+  --color-lab-border-strong: #2d3b52;
+  --color-lab-amber: #f59e0b;
+  --color-lab-cyan: #06b6d4;
+  --color-lab-emerald: #10b981;
+  --color-lab-rose: #f43f5e;
+}
+
+:root {
+  color-scheme: dark;
+  --bg-canvas: #07090e;
+  --bg-surface: #111622;
+  --border-hairline: #1e293b;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  background-color: var(--bg-canvas);
+  font-family: var(--font-sans);
+  letter-spacing: 0.01em;
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display);
+  text-wrap: balance;
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Precision hairline scrollbars for high-density panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0e17;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #233044;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334663;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
