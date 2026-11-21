@@ -2,44 +2,48 @@
  * Real-Time Dynamic Robotics Physics & Analytical IK Sandbox (`livePhysicsSandbox.ts`)
  *
  * Powers the interactive, continuously responsive 3D simulation stage inside
- * `RobotStage3D`. Rather than playing only static precomputed trajectories or
- * idling in a frozen standby pose, this engine runs a frame-rate-independent
- * rigid-body + 6-DOF analytical inverse-kinematics loop directly in the browser:
+ * `RobotStage3D`. Runs a frame-rate-independent rigid-body + 6-DOF analytical
+ * inverse-kinematics loop directly in the browser that executes the **complete
+ * pick-and-place manipulation task** from start to finish:
  *
- * 1. **Continuous Autonomous Pick-Lift-Place Cycle:** Immediately drives the
- *    articulated arm (`SO-ARM101` or `Franka Panda`) through Approach -> Descend
- *    -> Grasp -> Lift -> Hold -> Return with smooth exponential joint damping.
- * 2. **Interactive Tabletop Drag-and-Drop:** When the user drags the target
- *    object or any obstacle across the 3D workbench, the sandbox updates body
- *    coordinates in real time, resolves circle-circle obstacle collisions,
- *    recomputes the live 3D approach spline, and redirects the arm cleanly.
+ * 1. **Complete 8-Phase Task Execution Loop:**
+ *    `approach` -> `descend` -> `grasp` -> `lift` -> `transport` (over obstacles
+ *    to the Goal Placement Pad) -> `place` (lower & release inside the Goal Zone)
+ *    -> `retract` -> `complete` (verifies placement inside the Goal Pad and
+ *    increments `tasksCompleted` before beginning the next alternating transport
+ *    cycle between Zone A and Zone B).
+ * 2. **Interactive Tabletop Drag-and-Drop:** Dragging the target object or any
+ *    obstacle across the workbench updates coordinates in real time, resolves
+ *    obstacle collisions, recomputes the full pickup-to-goal 3D spline, and
+ *    redirects the arm cleanly.
  * 3. **Rigid-Body Impulse, Gravity, Slip & Collision Physics:** Supports live
  *    disturbance impulses ("Nudge"), dynamic Friction (mu), Mass (kg), and
  *    Approach Clearance sliders—producing authentic tip-over tumbles, gravity
  *    drops on low-friction slip, obstacle knocks, and contact force spikes
- *    (`> 45 N` fault threshold) with zero per-frame heap allocations in the
- *    inner step loop.
+ *    (`> 45 N` fault threshold) with zero per-frame heap allocations.
  *
  * Use cases:
- * - Making the 3D simulation stage genuinely alive on first load before any
- *   video is uploaded.
- * - Letting robotics engineers stress-test Gemini Carbon's reconstructed scene
- *   interactively by dragging obstacles into the approach corridor, lowering
- *   friction, or nudging the target object mid-grasp.
+ * - Demonstrating full pick-lift-transport-place task completion inside the 3D
+ *   workbench rather than stopping after picking up the object.
+ * - Stress-testing Gemini Carbon's reconstructed scene by dragging obstacles
+ *   into the transport path, lowering friction, or nudging the object mid-task.
  */
 
 import * as THREE from 'three';
 import { APP_CONFIG, type RobotModelId } from '../config/appConfig';
 import type { ControllerParams, SceneSpec, Vector3Tuple } from '../types/robotics';
 import { logFunctionCall } from '../utils/logger';
+import { resolveTaskGoalPose, type TaskGoalPose } from '../utils/taskGoalResolver';
 
 export type LiveSimPhase =
   | 'approach'
   | 'descend'
   | 'grasp'
   | 'lift'
-  | 'hold'
-  | 'return';
+  | 'transport'
+  | 'place'
+  | 'retract'
+  | 'complete';
 
 export interface LivePhysicsParams {
   friction: number;
@@ -75,14 +79,19 @@ export interface LiveTelemetrySnapshot {
   slipVelocityMs: number;
   objectHeightM: number;
   faultState: 'ok' | 'collision' | 'slip';
-  impactIntensity: number; // [0..1] drives visual contact ripple ring
+  impactIntensity: number; // [0..1] drives visual contact/completion ripple ring
+  impactKind: 'contact' | 'collision' | 'complete';
   impactPosition: Vector3Tuple;
   endEffectorPos: Vector3Tuple;
+  goalX: number;
+  goalZ: number;
+  tasksCompleted: number;
 }
 
 export interface LivePhysicsSandbox {
   targetBody: DynamicBodyState;
   obstacleBodies: DynamicBodyState[];
+  goalPose: TaskGoalPose;
   jointAngles: [number, number, number, number, number, number];
   gripperOpen: number;
   telemetry: LiveTelemetrySnapshot;
@@ -150,12 +159,14 @@ export function solveLiveArmIK(
 
 /**
  * Creates a fresh real-time dynamic physics sandbox synchronized with the
- * active `SceneSpec` target object and obstacle geometries.
+ * active `SceneSpec` target object, obstacle geometries, and resolved Goal Pad.
  */
 export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandbox {
+  const resolvedGoal = resolveTaskGoalPose(sceneSpec);
   logFunctionCall('createLivePhysicsSandbox', {
     targetName: sceneSpec.targetObject.name,
     obstacleCount: sceneSpec.obstacles.length,
+    goalPose: resolvedGoal,
   });
 
   const targetHalfH = Math.max(0.025, sceneSpec.targetObject.dimensions.y * 0.5);
@@ -208,6 +219,14 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     };
   });
 
+  // Active destination alternates between resolvedGoal (Zone B) and pickup home (Zone A)
+  // so continuous playback shows full pick-and-place task completion every cycle.
+  const goalPose: TaskGoalPose = { ...resolvedGoal };
+  let activeGoalX = resolvedGoal.x;
+  let activeGoalZ = resolvedGoal.z;
+  let transportStartX = targetBody.x;
+  let transportStartZ = targetBody.z;
+
   const jointAngles: [number, number, number, number, number, number] = [
     0.1, 1.05, -1.45, -1.15, 0, 0,
   ];
@@ -225,10 +244,12 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   let isGrasped = false;
   let cycleFault: 'ok' | 'collision' | 'slip' = 'ok';
   let impactIntensity = 0;
+  let impactKind: 'contact' | 'collision' | 'complete' = 'contact';
   let impactX = targetBody.x;
   let impactY = targetBody.y;
   let impactZ = targetBody.z;
   let nudgeCounter = 0;
+  let tasksCompleted = 0;
 
   const telemetry: LiveTelemetrySnapshot = {
     timeSec: 0,
@@ -238,14 +259,21 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     objectHeightM: targetBody.y,
     faultState: 'ok',
     impactIntensity: 0,
+    impactKind: 'contact',
     impactPosition: { x: targetBody.x, y: targetBody.y, z: targetBody.z },
     endEffectorPos: { x: eeX, y: eeY, z: eeZ },
+    goalX: activeGoalX,
+    goalZ: activeGoalZ,
+    tasksCompleted: 0,
   };
 
   /**
-   * Computes nearest obstacle proximity and height around the current target pose.
+   * Computes nearest obstacle proximity and height around a given tabletop point.
    */
-  const inspectNearestObstacle = (): {
+  const inspectNearestObstacleAt = (
+    px: number,
+    pz: number,
+  ): {
     minGap: number;
     obstacleHeight: number;
     nearest: DynamicBodyState | null;
@@ -255,7 +283,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     let nearest: DynamicBodyState | null = null;
     for (let i = 0; i < obstacleBodies.length; i++) {
       const obs = obstacleBodies[i];
-      const dist = Math.hypot(obs.x - targetBody.x, obs.z - targetBody.z);
+      const dist = Math.hypot(obs.x - px, obs.z - pz);
       const gap = dist - obs.radius - targetBody.radius;
       if (gap < minGap) {
         minGap = gap;
@@ -267,8 +295,33 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   };
 
   /**
+   * Picks the active destination pad farthest from the target's current spot
+   * (between the resolved Goal Pad and the pickup home pad) so the robot always
+   * has a clear transport task to complete.
+   */
+  const refreshActiveGoalForPickup = (): void => {
+    const distToPrimaryGoal = Math.hypot(
+      targetBody.x - resolvedGoal.x,
+      targetBody.z - resolvedGoal.z,
+    );
+    const distToHome = Math.hypot(
+      targetBody.x - targetBody.homeX,
+      targetBody.z - targetBody.homeZ,
+    );
+    if (distToPrimaryGoal >= 0.09 || distToPrimaryGoal >= distToHome) {
+      activeGoalX = resolvedGoal.x;
+      activeGoalZ = resolvedGoal.z;
+    } else {
+      activeGoalX = targetBody.homeX;
+      activeGoalZ = targetBody.homeZ;
+    }
+    goalPose.x = activeGoalX;
+    goalPose.z = activeGoalZ;
+  };
+
+  /**
    * Integrates rigid-body tabletop sliding, gravity drops, bounce restitution,
-   * tilt damping, and simple circle-circle obstacle collisions.
+   * tilt damping, and soft tabletop bounds.
    */
   const stepRigidBody = (
     body: DynamicBodyState,
@@ -282,7 +335,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     const [minX, maxX] = APP_CONFIG.simulation.liveSandbox.tableBoundsX;
     const [minZ, maxZ] = APP_CONFIG.simulation.liveSandbox.tableBoundsZ;
 
-    // Gravity when airborne
     if (body.y > body.halfHeight + 0.0005 || body.vy > 0) {
       body.vy -= g * dt;
       body.y += body.vy * dt;
@@ -290,6 +342,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
         body.y = body.halfHeight;
         if (Math.abs(body.vy) > 0.14) {
           impactIntensity = Math.max(impactIntensity, clamp(Math.abs(body.vy) * 0.85, 0.25, 1));
+          impactKind = 'contact';
           impactX = body.x;
           impactY = 0.004;
           impactZ = body.z;
@@ -304,7 +357,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
       body.vy = 0;
     }
 
-    // Horizontal motion + Coulomb surface friction
     body.x += body.vx * dt;
     body.z += body.vz * dt;
     const speed = Math.hypot(body.vx, body.vz);
@@ -319,7 +371,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
       body.vz = 0;
     }
 
-    // Clamp to calibrated tabletop bounds with soft rebound
     const boundMinX = body.isTarget ? minX : -0.16;
     const boundMaxX = body.isTarget ? maxX : 0.44;
     if (body.x < boundMinX) {
@@ -337,7 +388,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
       body.vz = -Math.abs(body.vz) * 0.4;
     }
 
-    // Angular tilt spring-damping (upright recovery below 0.55 rad, tipped rest above)
     body.tiltX += body.angVelX * dt;
     body.tiltZ += body.angVelZ * dt;
     const tiltMag = Math.hypot(body.tiltX, body.tiltZ);
@@ -356,11 +406,15 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
 
   /**
    * Resolves pairwise horizontal separation & elastic impulse transfer between
-   * the target object and nearby obstacles.
+   * the target object and nearby obstacles (skipped while target is lifted high).
    */
   const resolveBodyCollisions = (draggedBodyId: string | null): void => {
     for (let i = 0; i < obstacleBodies.length; i++) {
       const obs = obstacleBodies[i];
+      // Skip tabletop collision when target is carried cleanly above obstacle top
+      if (targetBody.y - targetBody.halfHeight > obs.halfHeight * 2 + 0.015) {
+        continue;
+      }
       const dx = targetBody.x - obs.x;
       const dz = targetBody.z - obs.z;
       const dist = Math.hypot(dx, dz);
@@ -395,6 +449,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
             obs.vx -= j * nx;
             obs.vz -= j * nz;
             impactIntensity = Math.max(impactIntensity, clamp(-relVn * 2.0, 0.2, 0.9));
+            impactKind = 'contact';
             impactX = (targetBody.x + obs.x) * 0.5;
             impactY = 0.04;
             impactZ = (targetBody.z + obs.z) * 0.5;
@@ -405,7 +460,8 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   };
 
   /**
-   * Advances the real-time physics & 6-DOF IK state machine by `dtSec`.
+   * Advances the real-time physics & 6-DOF IK state machine through the full
+   * Pick -> Lift -> Transport -> Place -> Release -> Retract -> Complete loop.
    */
   const step = (
     dtSec: number,
@@ -416,7 +472,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   ): void => {
     const dt = clamp(dtSec, 0.001, 0.045);
     simTime += dt;
-    impactIntensity = Math.max(0, impactIntensity - dt * 1.9);
+    impactIntensity = Math.max(0, impactIntensity - dt * 1.65);
 
     const g = APP_CONFIG.simulation.liveSandbox.gravityMs2;
     const friction = clamp(params.friction, 0.12, 1.0);
@@ -426,7 +482,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     const liftHeightM = clamp(controllerParams?.liftHeightM ?? 0.16, 0.12, 0.24);
     const approachHeightM = clamp(controllerParams?.approachHeightM ?? 0.17, 0.12, 0.24);
 
-    // Pause grasp attachment while user actively drags the target
     if (draggedBodyId === targetBody.id) {
       isGrasped = false;
       phase = 'approach';
@@ -437,12 +492,22 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
       targetBody.vz = 0;
       targetBody.tiltX *= Math.exp(-10 * dt);
       targetBody.tiltZ *= Math.exp(-10 * dt);
+      refreshActiveGoalForPickup();
     }
 
-    const { minGap, obstacleHeight, nearest } = inspectNearestObstacle();
-    const preGraspY = Math.max(targetBody.halfHeight + 0.07, approachHeightM + clearanceM * 0.75);
+    const { minGap, obstacleHeight, nearest } = inspectNearestObstacleAt(
+      targetBody.x,
+      targetBody.z,
+    );
+    const maxObstacleHeight = obstacleBodies.reduce(
+      (maxH, obs) => Math.max(maxH, obs.halfHeight * 2),
+      0.08,
+    );
+
+    const preGraspY = Math.max(targetBody.halfHeight + 0.075, approachHeightM + clearanceM * 0.72);
     const graspY = targetBody.halfHeight + 0.014;
-    const liftY = targetBody.halfHeight + liftHeightM;
+    const liftY = Math.max(targetBody.halfHeight + liftHeightM, maxObstacleHeight + 0.065);
+    const placeReleaseY = targetBody.halfHeight + 0.016;
 
     const requiredNormalForce = (massKg * g) / (2 * friction);
     const gripMargin = gripForceN * friction * 2 - massKg * g;
@@ -452,12 +517,11 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     let desiredEeX = eeX;
     let desiredEeY = eeY;
     let desiredEeZ = eeZ;
-    let desiredGripper = 0.92;
+    let desiredGripper = 0.94;
     let liveForceN = 0;
     let liveSlipMs = 0;
 
     if (draggedBodyId === targetBody.id) {
-      // Hover attentively above the user's dragged target in real time
       desiredEeX = targetBody.x;
       desiredEeY = preGraspY + 0.03;
       desiredEeZ = targetBody.z;
@@ -466,18 +530,17 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
       phaseElapsed += dt;
 
       if (phase === 'approach') {
-        const dur = 0.95;
+        const dur = 0.85;
         const u = clamp(phaseElapsed / dur, 0, 1);
-        const arc = Math.sin(u * Math.PI) * clearanceM * 0.6;
+        const arc = Math.sin(u * Math.PI) * clearanceM * 0.55;
         desiredEeX = targetBody.x;
         desiredEeY = preGraspY + arc;
         desiredEeZ = targetBody.z;
         desiredGripper = 0.95;
 
-        // If target slid while approaching, keep tracking until settled
         const targetSpeed = Math.hypot(targetBody.vx, targetBody.vz);
         if (u >= 1 && targetSpeed < 0.03 && targetBody.y <= targetBody.halfHeight + 0.005) {
-          // Gently upright tipped object right before next grasp cycle
+          refreshActiveGoalForPickup();
           targetBody.tiltX *= 0.2;
           targetBody.tiltZ *= 0.2;
           targetBody.angVelX = 0;
@@ -487,7 +550,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
           cycleFault = 'ok';
         }
       } else if (phase === 'descend') {
-        const dur = 0.65;
+        const dur = 0.6;
         const u = clamp(phaseElapsed / dur, 0, 1);
         const ease = u * u * (3 - 2 * u);
         desiredEeX = targetBody.x;
@@ -495,18 +558,17 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
         desiredEeZ = targetBody.z;
         desiredGripper = 0.92;
 
-        // Detect obstacle or high-speed approach collision
         if (u > 0.68 && (corridorCollisionRisk || clearanceShortfall > 0.03)) {
           cycleFault = 'collision';
           liveForceN = Number(
             (48 + clearanceShortfall * 320 + Math.max(0, 0.03 - minGap) * 420).toFixed(1),
           );
           impactIntensity = 1.0;
+          impactKind = 'collision';
           impactX = nearest ? (nearest.x + targetBody.x) * 0.5 : targetBody.x;
           impactY = targetBody.halfHeight + 0.02;
           impactZ = nearest ? (nearest.z + targetBody.z) * 0.5 : targetBody.z;
 
-          // Impart knock impulse to target and nearest obstacle
           const knockDirX = nearest ? targetBody.x - nearest.x : 0.04;
           const knockDirZ = nearest ? targetBody.z - nearest.z : 0.03;
           const norm = Math.max(0.01, Math.hypot(knockDirX, knockDirZ));
@@ -518,14 +580,14 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
             nearest.vz = -(knockDirZ / norm) * 0.14;
             nearest.angVelZ = 3.2;
           }
-          phase = 'return';
+          phase = 'retract';
           phaseElapsed = 0;
         } else if (u >= 1) {
           phase = 'grasp';
           phaseElapsed = 0;
         }
       } else if (phase === 'grasp') {
-        const dur = 0.48;
+        const dur = 0.42;
         const u = clamp(phaseElapsed / dur, 0, 1);
         desiredEeX = targetBody.x;
         desiredEeY = graspY;
@@ -535,7 +597,10 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
 
         if (u >= 1) {
           isGrasped = true;
-          impactIntensity = Math.max(impactIntensity, 0.35);
+          transportStartX = targetBody.x;
+          transportStartZ = targetBody.z;
+          impactIntensity = Math.max(impactIntensity, 0.38);
+          impactKind = 'contact';
           impactX = targetBody.x;
           impactY = targetBody.y;
           impactZ = targetBody.z;
@@ -543,17 +608,16 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
           phaseElapsed = 0;
         }
       } else if (phase === 'lift') {
-        const dur = 0.85;
+        const dur = 0.65;
         const u = clamp(phaseElapsed / dur, 0, 1);
         const ease = u * u * (3 - 2 * u);
-        desiredEeX = targetBody.x;
+        desiredEeX = transportStartX;
         desiredEeY = THREE.MathUtils.lerp(graspY, liftY, ease);
-        desiredEeZ = targetBody.z;
+        desiredEeZ = transportStartZ;
         desiredGripper = 0.22;
 
         const willSlip = gripMargin < 0.85;
-        if (willSlip && u > 0.36) {
-          // Physical grasp slip: object detaches and drops under gravity
+        if (willSlip && u > 0.38) {
           isGrasped = false;
           cycleFault = 'slip';
           liveSlipMs = clamp(0.11 + Math.max(0, 1.4 - gripMargin) * 0.045, 0.09, 0.34);
@@ -562,64 +626,104 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
           targetBody.vz = (nudgeCounter % 2 === 0 ? 1 : -1) * 0.06;
           targetBody.vy = -0.05;
           targetBody.angVelZ = -2.8;
-          phase = 'return';
+          phase = 'retract';
           phaseElapsed = 0;
         } else {
           liveForceN = Math.max(6.2, requiredNormalForce * 1.12);
           liveSlipMs = clamp(0.012 + (1 - friction) * 0.018, 0.006, 0.042);
           if (u >= 1) {
-            phase = 'hold';
+            phase = 'transport';
             phaseElapsed = 0;
           }
         }
-      } else if (phase === 'hold') {
-        const dur = 0.65;
-        desiredEeX = targetBody.x;
-        desiredEeY = liftY;
-        desiredEeZ = targetBody.z;
+      } else if (phase === 'transport') {
+        // Carry object smoothly along an obstacle-clearing parabolic arc to the Goal Pad
+        const dur = 1.05;
+        const u = clamp(phaseElapsed / dur, 0, 1);
+        const ease = u * u * (3 - 2 * u);
+        const arcBoost = Math.sin(u * Math.PI) * (clearanceM * 0.5 + 0.025);
+        desiredEeX = THREE.MathUtils.lerp(transportStartX, activeGoalX, ease);
+        desiredEeY = liftY + arcBoost;
+        desiredEeZ = THREE.MathUtils.lerp(transportStartZ, activeGoalZ, ease);
         desiredGripper = 0.22;
-        liveForceN = Math.max(6.0, requiredNormalForce * 1.08);
-        liveSlipMs = 0.008;
-        if (phaseElapsed >= dur) {
-          phase = 'return';
+        liveForceN = Math.max(6.0, requiredNormalForce * 1.1);
+        liveSlipMs = clamp(0.01 + (1 - friction) * 0.014, 0.006, 0.036);
+
+        if (u >= 1) {
+          phase = 'place';
           phaseElapsed = 0;
         }
-      } else {
-        // 'return': gently set object back down if still held, then retract to pre-grasp
-        const dur = isGrasped ? 0.95 : 0.72;
+      } else if (phase === 'place') {
+        // Controlled descent onto Goal Placement Pad + smooth jaw release
+        const dur = 0.85;
         const u = clamp(phaseElapsed / dur, 0, 1);
-        if (isGrasped) {
-          if (u < 0.65) {
-            const d = u / 0.65;
-            const ease = d * d * (3 - 2 * d);
-            desiredEeX = targetBody.x;
-            desiredEeY = THREE.MathUtils.lerp(liftY, graspY, ease);
-            desiredEeZ = targetBody.z;
-            desiredGripper = 0.22;
-            liveForceN = Math.max(5.2, requiredNormalForce);
-          } else {
-            isGrasped = false;
-            desiredEeX = targetBody.x;
-            desiredEeY = preGraspY;
-            desiredEeZ = targetBody.z;
-            desiredGripper = 0.95;
-          }
+        if (u < 0.72) {
+          const d = u / 0.72;
+          const ease = d * d * (3 - 2 * d);
+          desiredEeX = activeGoalX;
+          desiredEeY = THREE.MathUtils.lerp(liftY, placeReleaseY, ease);
+          desiredEeZ = activeGoalZ;
+          desiredGripper = 0.22;
+          liveForceN = Math.max(5.0, requiredNormalForce * (1 - d * 0.25));
+          liveSlipMs = 0.006;
         } else {
-          desiredEeX = 0.16;
-          desiredEeY = Math.max(0.25, preGraspY);
-          desiredEeZ = 0.0;
-          desiredGripper = 0.95;
+          const relU = (u - 0.72) / 0.28;
+          if (isGrasped) {
+            isGrasped = false;
+            targetBody.x = activeGoalX;
+            targetBody.y = targetBody.halfHeight;
+            targetBody.z = activeGoalZ;
+            targetBody.vx = 0;
+            targetBody.vy = 0;
+            targetBody.vz = 0;
+            targetBody.tiltX = 0;
+            targetBody.tiltZ = 0;
+            tasksCompleted += 1;
+            impactIntensity = 1.0;
+            impactKind = 'complete';
+            impactX = activeGoalX;
+            impactY = 0.004;
+            impactZ = activeGoalZ;
+          }
+          desiredEeX = activeGoalX;
+          desiredEeY = THREE.MathUtils.lerp(placeReleaseY, placeReleaseY + 0.04, relU);
+          desiredEeZ = activeGoalZ;
+          desiredGripper = THREE.MathUtils.lerp(0.22, 0.96, relU);
+          liveForceN = 0;
         }
 
         if (u >= 1) {
-          isGrasped = false;
+          phase = 'retract';
+          phaseElapsed = 0;
+        }
+      } else if (phase === 'retract') {
+        const dur = 0.65;
+        const u = clamp(phaseElapsed / dur, 0, 1);
+        const ease = u * u * (3 - 2 * u);
+        desiredEeX = THREE.MathUtils.lerp(activeGoalX, 0.15, ease);
+        desiredEeY = THREE.MathUtils.lerp(placeReleaseY + 0.05, Math.max(0.26, preGraspY), ease);
+        desiredEeZ = THREE.MathUtils.lerp(activeGoalZ, 0.0, ease);
+        desiredGripper = 0.96;
+
+        if (u >= 1) {
+          phase = cycleFault === 'ok' ? 'complete' : 'approach';
+          phaseElapsed = 0;
+        }
+      } else {
+        // 'complete': brief verification hold showing object cleanly resting on the Goal Pad
+        const dur = 0.9;
+        desiredEeX = 0.15;
+        desiredEeY = Math.max(0.26, preGraspY);
+        desiredEeZ = 0.0;
+        desiredGripper = 0.96;
+        if (phaseElapsed >= dur) {
+          refreshActiveGoalForPickup();
           phase = 'approach';
           phaseElapsed = 0;
         }
       }
     }
 
-    // Smoothly damp end-effector position and solve 6-DOF IK
     const eeLambda = 9.5;
     eeX = THREE.MathUtils.damp(eeX, desiredEeX, eeLambda, dt);
     eeY = THREE.MathUtils.damp(eeY, desiredEeY, eeLambda, dt);
@@ -632,7 +736,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     }
     gripperOpen = THREE.MathUtils.damp(gripperOpen, desiredGripper, 14, dt);
 
-    // Sync target body either locked inside gripper jaws or free under rigid-body physics
     if (isGrasped && draggedBodyId !== targetBody.id) {
       targetBody.x = eeX;
       targetBody.y = Math.max(targetBody.halfHeight, eeY - 0.014);
@@ -652,7 +755,6 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     }
     resolveBodyCollisions(draggedBodyId);
 
-    // Update live telemetry snapshot in-place (zero allocation)
     telemetry.timeSec = simTime;
     telemetry.phase = phase;
     telemetry.contactForceN = liveForceN;
@@ -660,12 +762,16 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     telemetry.objectHeightM = targetBody.y;
     telemetry.faultState = cycleFault;
     telemetry.impactIntensity = impactIntensity;
+    telemetry.impactKind = impactKind;
     telemetry.impactPosition.x = impactX;
     telemetry.impactPosition.y = impactY;
     telemetry.impactPosition.z = impactZ;
     telemetry.endEffectorPos.x = eeX;
     telemetry.endEffectorPos.y = eeY;
     telemetry.endEffectorPos.z = eeZ;
+    telemetry.goalX = activeGoalX;
+    telemetry.goalZ = activeGoalZ;
+    telemetry.tasksCompleted = tasksCompleted;
   };
 
   /**
@@ -693,12 +799,13 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   };
 
   /**
-   * Finalizes a tabletop drag interaction and triggers an immediate arm re-approach.
+   * Finalizes a tabletop drag interaction and triggers an immediate re-approach.
    */
   const finishBodyDrag = (bodyId: string): void => {
     logFunctionCall('livePhysicsSandbox.finishBodyDrag', { bodyId });
     if (bodyId === targetBody.id) {
       isGrasped = false;
+      refreshActiveGoalForPickup();
       phase = 'approach';
       phaseElapsed = 0;
       cycleFault = 'ok';
@@ -722,6 +829,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     targetBody.angVelZ = -Math.cos(angle) * 3.8;
     targetBody.angVelX = Math.sin(angle) * 3.2;
     impactIntensity = 0.8;
+    impactKind = 'contact';
     impactX = targetBody.x;
     impactY = targetBody.y;
     impactZ = targetBody.z;
@@ -730,7 +838,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   };
 
   /**
-   * Restores the target object and all obstacles cleanly to their calibrated home poses.
+   * Restores the target object, goal destination, and all obstacles cleanly to home.
    */
   const resetBodies = (): void => {
     logFunctionCall('livePhysicsSandbox.resetBodies');
@@ -738,6 +846,11 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     cycleFault = 'ok';
     phase = 'approach';
     phaseElapsed = 0;
+    tasksCompleted = 0;
+    activeGoalX = resolvedGoal.x;
+    activeGoalZ = resolvedGoal.z;
+    goalPose.x = activeGoalX;
+    goalPose.z = activeGoalZ;
 
     targetBody.x = targetBody.homeX;
     targetBody.y = targetBody.halfHeight;
@@ -766,8 +879,8 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   };
 
   /**
-   * Populates a pre-allocated array of `Vector3` waypoints tracing the live
-   * approach-descend-lift path to the target's current position (zero allocation).
+   * Populates a pre-allocated array of `Vector3` waypoints tracing the complete
+   * Pick -> Lift -> Transport Arc -> Goal Placement Pad path (zero allocation).
    */
   const computePreviewSplinePoints = (
     clearanceM: number,
@@ -775,8 +888,10 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
     outPoints: THREE.Vector3[],
   ): number => {
     const count = outPoints.length;
-    if (count < 6) return 0;
-    const preY = Math.max(targetBody.halfHeight + 0.08, 0.17 + clearanceM * 0.75);
+    if (count < 8) return 0;
+    const pickupX = isGrasped ? transportStartX : targetBody.x;
+    const pickupZ = isGrasped ? transportStartZ : targetBody.z;
+    const preY = Math.max(targetBody.halfHeight + 0.08, 0.17 + clearanceM * 0.72);
     const graspY = targetBody.halfHeight + 0.015;
     const liftY = targetBody.halfHeight + liftHeightM;
     const homeX = 0.14;
@@ -785,28 +900,36 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
 
     for (let i = 0; i < count; i++) {
       const u = i / (count - 1);
-      if (u < 0.45) {
-        const t = u / 0.45;
+      if (u < 0.25) {
+        // Home -> Pre-grasp arc above pickup
+        const t = u / 0.25;
         const ease = t * t * (3 - 2 * t);
         outPoints[i].set(
-          homeX + (targetBody.x - homeX) * ease,
-          homeY + (preY - homeY) * ease + Math.sin(t * Math.PI) * clearanceM * 0.65,
-          homeZ + (targetBody.z - homeZ) * ease,
+          homeX + (pickupX - homeX) * ease,
+          homeY + (preY - homeY) * ease + Math.sin(t * Math.PI) * clearanceM * 0.5,
+          homeZ + (pickupZ - homeZ) * ease,
         );
-      } else if (u < 0.72) {
-        const t = (u - 0.45) / 0.27;
+      } else if (u < 0.42) {
+        // Descend to grasp
+        const t = (u - 0.25) / 0.17;
+        outPoints[i].set(pickupX, THREE.MathUtils.lerp(preY, graspY, t), pickupZ);
+      } else if (u < 0.56) {
+        // Vertical lift
+        const t = (u - 0.42) / 0.14;
+        outPoints[i].set(pickupX, THREE.MathUtils.lerp(graspY, liftY, t), pickupZ);
+      } else if (u < 0.84) {
+        // Parabolic obstacle-clearing transport arc across workbench to Goal Pad
+        const t = (u - 0.56) / 0.28;
+        const ease = t * t * (3 - 2 * t);
         outPoints[i].set(
-          targetBody.x,
-          THREE.MathUtils.lerp(preY, graspY, t),
-          targetBody.z,
+          THREE.MathUtils.lerp(pickupX, activeGoalX, ease),
+          liftY + Math.sin(t * Math.PI) * (clearanceM * 0.5 + 0.025),
+          THREE.MathUtils.lerp(pickupZ, activeGoalZ, ease),
         );
       } else {
-        const t = (u - 0.72) / 0.28;
-        outPoints[i].set(
-          targetBody.x,
-          THREE.MathUtils.lerp(graspY, liftY, t),
-          targetBody.z,
-        );
+        // Controlled descent onto Goal Placement Pad
+        const t = (u - 0.84) / 0.16;
+        outPoints[i].set(activeGoalX, THREE.MathUtils.lerp(liftY, graspY, t), activeGoalZ);
       }
     }
     return count;
@@ -815,6 +938,7 @@ export function createLivePhysicsSandbox(sceneSpec: SceneSpec): LivePhysicsSandb
   return {
     targetBody,
     obstacleBodies,
+    goalPose,
     jointAngles,
     gripperOpen,
     telemetry,

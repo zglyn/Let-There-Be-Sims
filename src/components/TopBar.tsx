@@ -22,6 +22,7 @@ export type ActiveWorkspaceView =
   | 'command_center'
   | 'mobile_capture'
   | 'policy_diff'
+  | 'regression_ci'
   | 'cloud_swarm'
   | 'bundle';
 
@@ -36,8 +37,9 @@ const NAV_ITEMS: Array<{ id: ActiveWorkspaceView; label: string }> = [
   { id: 'command_center', label: 'Command Center' },
   { id: 'mobile_capture', label: 'Mobile Capture' },
   { id: 'policy_diff', label: 'Policy Diff' },
+  { id: 'regression_ci', label: 'Regression CI' },
   { id: 'cloud_swarm', label: 'Cloud Swarm' },
-  { id: 'bundle', label: 'Bundle' },
+  { id: 'bundle', label: 'Train & Export' },
 ];
 
 /**

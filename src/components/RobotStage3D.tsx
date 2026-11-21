@@ -67,6 +67,7 @@ import {
 import type { RolloutResult, SceneSpec } from '../types/robotics';
 import { logFunctionCall } from '../utils/logger';
 import { formatElapsedSeconds } from '../utils/pipelineProgress';
+import { resolveTaskGoalPose } from '../utils/taskGoalResolver';
 import {
   createLivePhysicsSandbox,
   type LivePhysicsParams,
@@ -115,6 +116,7 @@ interface LiveHudReadout {
   slipVelocityMs: number;
   objectHeightM: number;
   faultState: 'ok' | 'collision' | 'slip';
+  tasksCompleted: number;
 }
 
 const DEFAULT_STANDBY_SPEC: SceneSpec = {
@@ -249,6 +251,7 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
     slipVelocityMs: 0,
     objectHeightM: 0.048,
     faultState: 'ok',
+    tasksCompleted: 0,
   });
   const [hoveredBodyName, setHoveredBodyName] = useState<string | null>(null);
   const [draggedBodyName, setDraggedBodyName] = useState<string | null>(null);
@@ -308,6 +311,8 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
   );
   const forceArrowRef = useRef<THREE.ArrowHelper | null>(null);
   const impactRingRef = useRef<THREE.Mesh | null>(null);
+  const goalPadGroupRef = useRef<THREE.Group | null>(null);
+  const goalPadRingMatRef = useRef<THREE.MeshBasicMaterial | null>(null);
   const hoverRingRef = useRef<THREE.Mesh | null>(null);
   const gridPlaneRef = useRef<THREE.Mesh | null>(null);
   const tableBaseRef = useRef<THREE.Mesh | null>(null);
@@ -692,6 +697,49 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
     scene.add(impactRing);
     impactRingRef.current = impactRing;
 
+    // Composite 3D Goal Placement Pad (Destination Target Zone for Full Task Completion)
+    const goalPadGroup = new THREE.Group();
+    const goalBaseGeo = new THREE.CylinderGeometry(0.056, 0.06, 0.0025, 36);
+    const goalBaseMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.35,
+      metalness: 0.72,
+    });
+    const goalBaseMesh = new THREE.Mesh(goalBaseGeo, goalBaseMat);
+    goalBaseMesh.position.y = 0.0014;
+    goalPadGroup.add(goalBaseMesh);
+
+    const goalOuterRingGeo = new THREE.RingGeometry(0.046, 0.055, 36);
+    const goalOuterRingMat = new THREE.MeshBasicMaterial({
+      color: 0x10b981,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+    });
+    const goalOuterRing = new THREE.Mesh(goalOuterRingGeo, goalOuterRingMat);
+    goalOuterRing.rotation.x = -Math.PI / 2;
+    goalOuterRing.position.y = 0.0032;
+    goalPadGroup.add(goalOuterRing);
+
+    const goalInnerRingGeo = new THREE.RingGeometry(0.016, 0.022, 28);
+    const goalInnerRingMat = new THREE.MeshBasicMaterial({
+      color: 0x34d399,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.7,
+      depthWrite: false,
+    });
+    const goalInnerRing = new THREE.Mesh(goalInnerRingGeo, goalInnerRingMat);
+    goalInnerRing.rotation.x = -Math.PI / 2;
+    goalInnerRing.position.y = 0.0033;
+    goalPadGroup.add(goalInnerRing);
+
+    goalPadGroup.position.set(0.22, 0, -0.16);
+    scene.add(goalPadGroup);
+    goalPadGroupRef.current = goalPadGroup;
+    goalPadRingMatRef.current = goalOuterRingMat;
+
     // Interactive Hover / Drag Selection Halo Ring
     const hoverRingGeo = new THREE.RingGeometry(0.044, 0.052, 36);
     const hoverRingMat = new THREE.MeshBasicMaterial({
@@ -939,6 +987,28 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
           }
         }
 
+        // Sync 3D Goal Placement Pad in Replay mode and highlight emerald when the object lands on the pad
+        if (goalPadGroupRef.current) {
+          const replayGoal = resolveTaskGoalPose(spec);
+          goalPadGroupRef.current.visible = !hideRobotArmRef.current;
+          goalPadGroupRef.current.position.set(replayGoal.x, 0, replayGoal.z);
+          if (goalPadRingMatRef.current) {
+            const distToGoal = targetMesh
+              ? Math.hypot(
+                  targetMesh.position.x - replayGoal.x,
+                  targetMesh.position.z - replayGoal.z,
+                )
+              : 1;
+            const isLandedOnGoal =
+              distToGoal <= replayGoal.radiusM + 0.03 &&
+              (targetMesh ? targetMesh.position.y <= 0.12 : false);
+            goalPadRingMatRef.current.color.setHex(isLandedOnGoal ? 0x34d399 : 0x10b981);
+            goalPadRingMatRef.current.opacity = isLandedOnGoal
+              ? 0.95 + Math.sin(nowMs * 0.012) * 0.05
+              : 0.72;
+          }
+        }
+
         // Contact shockwave ring on force spikes during replay
         if (ring) {
           if (force > 22) {
@@ -1047,23 +1117,45 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
           }
         }
 
-        // Expanding contact impact ripple ring
+        // Sync 3D Goal Placement Pad with the sandbox's active destination zone
+        if (goalPadGroupRef.current) {
+          goalPadGroupRef.current.visible = !hideRobotArmRef.current;
+          goalPadGroupRef.current.position.set(
+            sandbox.telemetry.goalX,
+            0,
+            sandbox.telemetry.goalZ,
+          );
+          if (goalPadRingMatRef.current) {
+            const isPlacingOrDone =
+              sandbox.telemetry.phase === 'place' || sandbox.telemetry.phase === 'complete';
+            goalPadRingMatRef.current.color.setHex(isPlacingOrDone ? 0x34d399 : 0x10b981);
+            goalPadRingMatRef.current.opacity = isPlacingOrDone
+              ? 0.95 + Math.sin(nowMs * 0.012) * 0.05
+              : 0.72;
+          }
+        }
+
+        // Expanding contact / collision / task-completion ripple ring
         if (ring) {
           const intensity = sandbox.telemetry.impactIntensity;
           if (intensity > 0.03) {
             ring.visible = true;
             ring.position.set(
               sandbox.telemetry.impactPosition.x,
-              0.003,
+              0.0035,
               sandbox.telemetry.impactPosition.z,
             );
-            const scale = 1.0 + (1 - intensity) * 2.6;
+            const scale = 1.0 + (1 - intensity) * 2.8;
             ring.scale.set(scale, scale, 1);
             const mat = ring.material as THREE.MeshBasicMaterial;
             mat.color.setHex(
-              sandbox.telemetry.faultState === 'collision' ? 0xf43f5e : 0xf59e0b,
+              sandbox.telemetry.impactKind === 'complete'
+                ? 0x10b981
+                : sandbox.telemetry.faultState === 'collision'
+                  ? 0xf43f5e
+                  : 0xf59e0b,
             );
-            mat.opacity = intensity * 0.85;
+            mat.opacity = intensity * 0.9;
           } else {
             ring.visible = false;
           }
@@ -1079,6 +1171,7 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
             slipVelocityMs: sandbox.telemetry.slipVelocityMs,
             objectHeightM: sandbox.telemetry.objectHeightM,
             faultState: sandbox.telemetry.faultState,
+            tasksCompleted: sandbox.telemetry.tasksCompleted,
           });
         }
       }
@@ -1149,6 +1242,12 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
       liveLineMat.dispose();
       impactRingGeo.dispose();
       impactRingMat.dispose();
+      goalBaseGeo.dispose();
+      goalBaseMat.dispose();
+      goalOuterRingGeo.dispose();
+      goalOuterRingMat.dispose();
+      goalInnerRingGeo.dispose();
+      goalInnerRingMat.dispose();
       hoverRingGeo.dispose();
       hoverRingMat.dispose();
       envTex.dispose();
@@ -1360,7 +1459,9 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
               ? 'Scene Map Mode'
               : effectiveSimMode === 'replay' && activeRollout
                 ? `Env E${String(activeRollout.envId).padStart(2, '0')} · Iter ${iterationNumber ?? 1}`
-                : `Live Physics · ${liveHud.phase.toUpperCase()}`}
+                : liveHud.phase === 'complete'
+                  ? `Live Physics · TASK COMPLETE ✓ (${liveHud.tasksCompleted})`
+                  : `Live Physics · ${liveHud.phase.toUpperCase()}${liveHud.tasksCompleted > 0 ? ` · ${liveHud.tasksCompleted} Done` : ''}`}
           </span>
           {sceneSpec && !hideRobotArm && (
             <>
@@ -1388,7 +1489,7 @@ export const RobotStage3D: React.FC<RobotStage3DProps> = ({
                   activeRollout.success ? 'text-emerald-400' : 'text-rose-400'
                 }`}
               >
-                {activeRollout.success ? '✓ Pass' : '✕ Fault'}
+                {activeRollout.success ? '✓ Task Complete' : '✕ Fault'}
               </span>
             </>
           ) : (

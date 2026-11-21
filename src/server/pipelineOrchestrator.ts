@@ -54,6 +54,7 @@ import {
   parseStructuredJson,
   prepareMediaForInteractions,
 } from './geminiClient';
+import { saveSessionAsRegressionCase } from './regressionSuiteStore';
 import { evaluateBuiltInSwarm } from './physicsEvaluator';
 import {
   broadcastSessionEvent,
@@ -562,6 +563,41 @@ export async function runFailureToPolicyPipeline(
                 required: ['id', 'friction', 'mass', 'xyOffset'],
               },
             },
+            handDemoRetarget: {
+              type: 'object',
+              properties: {
+                detected: { type: 'boolean' },
+                spokenInstructionTranscript: { type: 'string' },
+                retargetedRobot: { type: 'string' },
+                obstacleAvoidedName: { type: 'string' },
+                pickupPos: {
+                  type: 'object',
+                  properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+                  required: ['x', 'y', 'z'],
+                },
+                apexWaypointPos: {
+                  type: 'object',
+                  properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+                  required: ['x', 'y', 'z'],
+                },
+                placePos: {
+                  type: 'object',
+                  properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+                  required: ['x', 'y', 'z'],
+                },
+                retargetNotes: { type: 'string' },
+              },
+              required: [
+                'detected',
+                'spokenInstructionTranscript',
+                'retargetedRobot',
+                'obstacleAvoidedName',
+                'pickupPos',
+                'apexWaypointPos',
+                'placePos',
+                'retargetNotes',
+              ],
+            },
           },
           required: [
             'hasRobotInVideo',
@@ -579,9 +615,38 @@ export async function runFailureToPolicyPipeline(
             'initialControllerPython',
             'controllerParams',
             'randomizations',
+            'handDemoRetarget',
           ],
         },
       };
+
+      const mobileSensors = record.state.mobileSensors;
+      const sensorPromptLines: string[] = [];
+      if (mobileSensors) {
+        sensorPromptLines.push(
+          `MOBILE QR CAPTURE TELEMETRY (mode=${mobileSensors.captureMode}, clip=${mobileSensors.clipDurationSec}s, audio_track=${mobileSensors.hasAudioTrack}):`,
+        );
+        if (mobileSensors.tapTarget) {
+          sensorPromptLines.push(
+            `- TAP-SELECTED TARGET OBJECT: The judge tapped directly on the target object at normalized viewfinder coordinates (x=${(mobileSensors.tapTarget.x * 100).toFixed(1)}% from left, y=${(mobileSensors.tapTarget.y * 100).toFixed(1)}% from top). Anchor 'targetObject' strictly to the physical object located at that tapped point.`,
+          );
+        }
+        if (mobileSensors.gravityVector) {
+          const g = mobileSensors.gravityVector;
+          const ori = mobileSensors.orientationDeg;
+          sensorPromptLines.push(
+            `- DEVICEORIENTATION GRAVITY VECTOR: g=(${g.x.toFixed(3)}, ${g.y.toFixed(3)}, ${g.z.toFixed(3)}) m/s^2` +
+              (ori
+                ? ` (alpha=${ori.alpha}°, beta=${ori.beta}°, gamma=${ori.gamma}°, camera_tilt=${ori.cameraTiltDeg}°). Use this gravity vector to level the tabletop plane at y=0 and remove camera pitch/roll distortion.`
+                : '. Use this gravity vector to level the tabletop plane at y=0.'),
+          );
+        }
+        if (mobileSensors.hasAudioTrack) {
+          sensorPromptLines.push(
+            `- AUDIO TRACK PRESENT: Listen carefully to the video's audio track for spoken voice instructions (e.g. obstacle warnings, target drop spot, or gentle grasp hints), transcribe what the judge said into 'handDemoRetarget.spokenInstructionTranscript', and apply those constraints to the scene and controller.`,
+          );
+        }
+      }
 
       const carbonContentParts: Array<
         Awaited<ReturnType<typeof prepareMediaForInteractions>> | { type: 'text'; text: string }
@@ -596,12 +661,14 @@ export async function runFailureToPolicyPipeline(
           (secondaryMediaPart
             ? `MULTI-VIEW INPUT: Two camera views are provided in order (View 1: Primary Workcell Camera, View 2: Secondary / Wrist / Alternate Camera). Fuse both camera angles to triangulate metric 3D poses, resolve occlusions, and evaluate grasp contact accurately.\n`
             : '') +
-          `1) FIRST determine honestly whether an actual robotic arm, gripper, or robot is visibly present ('hasRobotInVideo': true/false) and describe it in 'detectedRobotDescription' (or state "No robotic arm detected — environment-only capture").\n` +
-          `2) CLASSIFY 'executionOutcome' strictly as one of three values: "no_robot" (if hasRobotInVideo is false), "success" (if a robot is present and visibly completes the manipulation task cleanly without dropping, colliding, or failing), or "failure" (if a robot is present and visibly fails — collision, tip-over, slip, missed grasp, stuck, or incomplete task). Provide a concise 1–2 sentence verdict in 'outcomeSummary', and put detailed physical root-cause diagnosis (if failure) or grasp robustness & clearance margin analysis (if success) in 'failureAnalysis'.\n` +
+          (sensorPromptLines.length > 0 ? `${sensorPromptLines.join('\n')}\n` : '') +
+          `1) FIRST determine honestly whether an actual robotic arm/gripper is visibly present ('hasRobotInVideo': true/false) AND whether a human hand is demonstrating moving an object around an obstacle ('handDemoRetarget.detected': true/false). Describe what you see in 'detectedRobotDescription'.\n` +
+          `2) CLASSIFY 'executionOutcome' strictly as one of four values: "hand_demo" (if a human hand demonstrates picking up and moving a tabletop object around an obstacle to a destination so we should retarget the trajectory to ${robotSpec.name}), "success" (if a robot is present and visibly completes the manipulation task cleanly), "failure" (if a robot is present and visibly fails — collision, tip-over, slip, missed grasp, stuck, or incomplete task), or "no_robot" (only if neither a robot nor a human manipulation demonstration is present). Provide a concise 1–2 sentence verdict in 'outcomeSummary', and detailed physical diagnosis or hand-to-robot kinematic retargeting notes in 'failureAnalysis'.\n` +
           `3) Calibrate metric 3D coordinates (meters, origin x=0,y=0,z=0 near front-center tabletop edge; tabletop surface at y=0; primary target object placed in x in [0.16, 0.34], z in [-0.18, 0.18]).\n` +
-          `4) Reconstruct the primary target object and ALL notable nearby tabletop/scene obstacles (1 to 7 objects, each with shape one of: mug, cylinder, box, bottle, sphere), plus 2–4 'spatialZones' (kind: 'robot_mount', 'clear_zone', or 'hazard_zone') and 'recommendedRobotBase' ({x, z}) so the 2D top-down spatial map is accurate and ready for simulation.\n` +
-          `5) Generate valid simulation-ready MuJoCo MJCF XML (<mujoco>) containing 'target_body', 'target_object' geom, and all mapped obstacles (omit robot joints in the scene XML if hasRobotInVideo is false).\n` +
-          `6) Emit a baseline Python controller ('def execute_policy(model, data, step):'), numeric 'controllerParams', and 20 'randomizations' (ids 1..20). If executionOutcome is "success", tune the baseline controllerParams to reflect the successful nominal demonstration so the 20-env swarm can stress-test its robustness margins under friction/mass/pose perturbations.`,
+          `4) Reconstruct the primary target object and ALL notable nearby tabletop/scene obstacles (1 to 7 objects, each with shape one of: mug, cylinder, box, bottle, sphere), plus 2–4 'spatialZones' (kind: 'robot_mount', 'clear_zone', or 'hazard_zone') and 'recommendedRobotBase' ({x, z}).\n` +
+          `5) Fill 'handDemoRetarget': if a human hand demo is visible (or mobile captureMode is hand_demo), set detected=true, transcribe any spoken audio into 'spokenInstructionTranscript', set retargetedRobot='${robotSpec.name}', identify 'obstacleAvoidedName', and output the metric 3D 'pickupPos', 'apexWaypointPos' (clearing the obstacle), and 'placePos' (where the hand set the object down, within x in [0.15, 0.33], z in [-0.22, 0.22]). Also place a 'clear_zone' at 'placePos'. If no hand demo is present, set detected=false with zeroed placeholders.\n` +
+          `6) Generate valid simulation-ready MuJoCo MJCF XML (<mujoco>) containing 'target_body', 'target_object' geom, and all mapped obstacles.\n` +
+          `7) Emit a baseline Python controller ('def execute_policy(model, data, step):'), numeric 'controllerParams', and 20 'randomizations' (ids 1..20). For hand_demo retargeting, emit an initial kinematic retargeting controller for ${robotSpec.name} that mirrors the hand's pickup -> obstacle-clearing arc -> placement so Hydrogen & Neon can stress-test and repair any slip or obstacle-collision edge cases across 20 randomized rollouts.`,
       });
 
       const carbonPrompt = [
@@ -617,7 +684,7 @@ export async function runFailureToPolicyPipeline(
         thinkingLevel: APP_CONFIG.models.spatialArchitect.thinkingLevel,
         input: carbonPrompt,
         systemInstruction:
-          'You are a robotics perception, 3D scene reconstruction, and MuJoCo physics architect. Be strictly truthful about both robot presence (hasRobotInVideo) and whether the robot succeeded or failed (executionOutcome: "success" | "failure" | "no_robot"). Return strictly valid JSON matching the requested schema.',
+          'You are a robotics perception, 3D scene reconstruction, human-hand-to-SO-ARM101 kinematic retargeting, and MuJoCo physics architect. Be strictly truthful about robot presence (hasRobotInVideo), human hand demonstrations (handDemoRetarget.detected), spoken audio instructions, and executionOutcome ("hand_demo" | "success" | "failure" | "no_robot"). Return strictly valid JSON matching the requested schema.',
         responseFormat: carbonResponseFormat,
         background: true,
         waitForCompletion: true,
@@ -641,14 +708,22 @@ export async function runFailureToPolicyPipeline(
 
       const hasRobotInVideo = Boolean(parsedCarbon.hasRobotInVideo);
       const rawOutcome = String(parsedCarbon.executionOutcome ?? '').toLowerCase().trim();
-      const executionOutcome: ExecutionOutcome = !hasRobotInVideo
-        ? 'no_robot'
-        : rawOutcome === 'success'
-          ? 'success'
-          : 'failure';
+      const isHandDemo =
+        Boolean(parsedCarbon.handDemoRetarget?.detected) ||
+        rawOutcome === 'hand_demo' ||
+        record.state.mobileSensors?.captureMode === 'hand_demo';
 
-      const sceneMode: SceneMode =
-        !hasRobotInVideo && !forceSimulateRobot
+      const executionOutcome: ExecutionOutcome = isHandDemo
+        ? 'hand_demo'
+        : !hasRobotInVideo
+          ? 'no_robot'
+          : rawOutcome === 'success'
+            ? 'success'
+            : 'failure';
+
+      const sceneMode: SceneMode = isHandDemo
+        ? 'hand_demo_retarget'
+        : !hasRobotInVideo && !forceSimulateRobot
           ? 'scene_map_only'
           : executionOutcome === 'success'
             ? 'robot_success_verification'
@@ -656,16 +731,54 @@ export async function runFailureToPolicyPipeline(
 
       const outcomeSummary =
         (parsedCarbon.outcomeSummary && parsedCarbon.outcomeSummary.trim()) ||
-        (executionOutcome === 'no_robot'
-          ? 'Environment-only capture with no robot arm detected; simulation-ready spatial map generated.'
-          : executionOutcome === 'success'
-            ? 'Nominal robot execution succeeded; launching 20-environment robustness stress test.'
-            : 'Manipulation failure observed in source footage; launching closed-loop policy repair.');
+        (executionOutcome === 'hand_demo'
+          ? `Human hand demonstration retargeted to ${robotSpec.name}; launching 20-env Hydrogen/Neon verification to eliminate slip & obstacle collisions.`
+          : executionOutcome === 'no_robot'
+            ? 'Environment-only capture with no robot arm detected; simulation-ready spatial map generated.'
+            : executionOutcome === 'success'
+              ? 'Nominal robot execution succeeded; launching 20-environment robustness stress test.'
+              : 'Manipulation failure observed in source footage; launching closed-loop policy repair.');
+
+      // If the judge spoke a clear task instruction in the audio track, surface it on the session
+      const spokenTranscript = parsedCarbon.handDemoRetarget?.spokenInstructionTranscript?.trim() ?? '';
+      if (
+        isHandDemo &&
+        spokenTranscript.length >= 6 &&
+        record.state.taskGoal === APP_CONFIG.simulation.defaultTaskGoal
+      ) {
+        record.state.taskGoal = spokenTranscript.slice(0, 320);
+      }
 
       const recommendedBase = {
         x: Math.max(-0.18, Math.min(0.18, parsedCarbon.recommendedRobotBase?.x ?? 0)),
         z: Math.max(-0.18, Math.min(0.18, parsedCarbon.recommendedRobotBase?.z ?? 0)),
       };
+
+      const normalizedHandRetarget = parsedCarbon.handDemoRetarget
+        ? {
+            detected: isHandDemo,
+            spokenInstructionTranscript: spokenTranscript,
+            retargetedRobot: parsedCarbon.handDemoRetarget.retargetedRobot || robotSpec.name,
+            obstacleAvoidedName:
+              parsedCarbon.handDemoRetarget.obstacleAvoidedName ||
+              parsedCarbon.obstacles?.[0]?.name ||
+              'tabletop obstacle',
+            pickupPos: parsedCarbon.handDemoRetarget.pickupPos ?? parsedCarbon.targetObject.position,
+            apexWaypointPos: parsedCarbon.handDemoRetarget.apexWaypointPos ?? {
+              x: parsedCarbon.targetObject.position.x,
+              y: 0.19,
+              z: 0,
+            },
+            placePos: parsedCarbon.handDemoRetarget.placePos ?? {
+              x: parsedCarbon.targetObject.position.x,
+              y: parsedCarbon.targetObject.position.y,
+              z: parsedCarbon.targetObject.position.z >= 0 ? -0.16 : 0.16,
+            },
+            retargetNotes:
+              parsedCarbon.handDemoRetarget.retargetNotes ||
+              `Retargeted human hand obstacle-avoidance arc to ${robotSpec.name} 6-DOF kinematics.`,
+          }
+        : null;
 
       sceneSpec = {
         hasRobotInVideo,
@@ -674,7 +787,11 @@ export async function runFailureToPolicyPipeline(
         sceneMode,
         detectedRobotDescription:
           parsedCarbon.detectedRobotDescription ||
-          (hasRobotInVideo ? robotSpec.name : 'No robotic arm detected — environment-only capture'),
+          (isHandDemo
+            ? `Human hand demonstration retargeted to ${robotSpec.name}`
+            : hasRobotInVideo
+              ? robotSpec.name
+              : 'No robotic arm detected — environment-only capture'),
         failureAnalysis: parsedCarbon.failureAnalysis,
         calibrationNotes: parsedCarbon.calibrationNotes,
         tableDimensions: {
@@ -720,6 +837,7 @@ export async function runFailureToPolicyPipeline(
           parsedCarbon.targetObject.friction ?? 0.45,
           parsedCarbon.targetObject.massKg ?? 0.24,
         ),
+        handDemoRetarget: normalizedHandRetarget,
       };
 
       lastInteractionId = carbonTurn.id;
@@ -734,16 +852,20 @@ export async function runFailureToPolicyPipeline(
         stageLabel:
           sceneMode === 'scene_map_only'
             ? 'Scene Map & MuJoCo XML Ready'
-            : 'Stage 1/4 · Scene Calibrated',
+            : sceneMode === 'hand_demo_retarget'
+              ? `Stage 1/4 · Hand Demo Retargeted to ${robotSpec.name}`
+              : 'Stage 1/4 · Scene Calibrated',
       });
       updateStage(record, 'carbon_reconstruct', {
         status: 'completed',
         detail:
           sceneMode === 'scene_map_only'
             ? `No robot detected — compiled simulation-ready 3D scene & 2D spatial map (${1 + sceneSpec.obstacles.length} mapped objects).`
-            : sceneMode === 'robot_success_verification'
-              ? `Successful demonstration detected — calibrated ${sceneSpec.targetObject.name} + ${sceneSpec.obstacles.length} obstacle(s) for 20-env robustness stress test.`
-              : `Failure detected — reconstructed ${sceneSpec.targetObject.name} + ${sceneSpec.obstacles.length} obstacle(s) and 20 MuJoCo repair variants.`,
+            : sceneMode === 'hand_demo_retarget'
+              ? `Hand demo retargeted to ${robotSpec.name} — calibrated ${sceneSpec.targetObject.name} around ${normalizedHandRetarget?.obstacleAvoidedName ?? 'obstacles'} for 20-env verification.`
+              : sceneMode === 'robot_success_verification'
+                ? `Successful demonstration detected — calibrated ${sceneSpec.targetObject.name} + ${sceneSpec.obstacles.length} obstacle(s) for 20-env robustness stress test.`
+                : `Failure detected — reconstructed ${sceneSpec.targetObject.name} + ${sceneSpec.obstacles.length} obstacle(s) and 20 MuJoCo repair variants.`,
         interactionId: carbonTurn.id,
         previousInteractionId: null,
       });
@@ -756,9 +878,11 @@ export async function runFailureToPolicyPipeline(
         title:
           sceneMode === 'scene_map_only'
             ? 'Scene Map & Simulation-Ready MJCF Compilation'
-            : sceneMode === 'robot_success_verification'
-              ? 'Successful Demo Reconstruction & Stress-Test Setup'
-              : 'Spatial Real-to-Sim Failure Reconstruction',
+            : sceneMode === 'hand_demo_retarget'
+              ? `Hand-to-${robotSpec.name} Trajectory Retargeting & MuJoCo Calibration`
+              : sceneMode === 'robot_success_verification'
+                ? 'Successful Demo Reconstruction & Stress-Test Setup'
+                : 'Spatial Real-to-Sim Failure Reconstruction',
         thoughtSummary: carbonTurn.thoughtSummary || sceneSpec.calibrationNotes,
         outputExcerpt: `${sceneSpec.outcomeSummary} — ${sceneSpec.failureAnalysis}`,
         durationMs: carbonTurn.durationMs,
@@ -1157,6 +1281,22 @@ export async function runFailureToPolicyPipeline(
       durationMs: bundleTurn.durationMs,
       timestamp: new Date().toISOString(),
     });
+
+    // Automatically promote real-world failure repairs into the permanent Regression CI Suite
+    if (
+      APP_CONFIG.regressionCi.autoPromoteFailures &&
+      record.state.sceneSpec &&
+      record.state.iterations.length > 0
+    ) {
+      try {
+        saveSessionAsRegressionCase({ session: record.state });
+      } catch (promoErr) {
+        logFunctionCall('pipelineOrchestrator.autoPromoteRegressionSkipped', {
+          sessionId: record.state.id,
+          reason: promoErr instanceof Error ? promoErr.message : String(promoErr),
+        });
+      }
+    }
 
     broadcastSessionEvent(record, { type: 'bundle_update', bundle });
     broadcastSessionEvent(record, { type: 'pipeline_complete', session: record.state });

@@ -16,7 +16,17 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronDown, Download, FileCode2, FileJson, FileSpreadsheet, FileText } from 'lucide-react';
+import {
+  ChevronDown,
+  Database,
+  Download,
+  FileCode2,
+  FileJson,
+  FileSpreadsheet,
+  FileText,
+  GitBranch,
+  Layers,
+} from 'lucide-react';
 import { APP_CONFIG, type RobotModelId } from '../config/appConfig';
 import type { CompilerSessionState } from '../types/robotics';
 import { logFunctionCall } from '../utils/logger';
@@ -31,6 +41,9 @@ interface SessionExportBarProps {
   session: CompilerSessionState;
   robotModel: RobotModelId;
   onExported: (message: string) => void;
+  onPromoteToRegressionCi?: () => Promise<void>;
+  isPromotingRegression?: boolean;
+  onOpenTrainingStudio?: (tab: 'gym_mjx' | 'lerobot') => void;
 }
 
 /**
@@ -40,6 +53,9 @@ export const SessionExportBar: React.FC<SessionExportBarProps> = ({
   session,
   robotModel,
   onExported,
+  onPromoteToRegressionCi,
+  isPromotingRegression = false,
+  onOpenTrainingStudio,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuContainerRef = useRef<HTMLDivElement | null>(null);
@@ -132,16 +148,29 @@ export const SessionExportBar: React.FC<SessionExportBarProps> = ({
               className={`font-mono-tabular font-medium ${
                 session.sceneSpec.executionOutcome === 'success'
                   ? 'text-emerald-400'
-                  : session.sceneSpec.executionOutcome === 'no_robot'
-                    ? 'text-cyan-400'
-                    : 'text-rose-400'
+                  : session.sceneSpec.executionOutcome === 'hand_demo'
+                    ? 'text-amber-300'
+                    : session.sceneSpec.executionOutcome === 'no_robot'
+                      ? 'text-cyan-400'
+                      : 'text-rose-400'
               }`}
             >
               {session.sceneSpec.executionOutcome === 'success'
                 ? '✓ Successful Demo'
-                : session.sceneSpec.executionOutcome === 'no_robot'
-                  ? '◎ Scene Map'
-                  : '✕ Failure Detected'}
+                : session.sceneSpec.executionOutcome === 'hand_demo'
+                  ? '▸ Hand Demo → SO-ARM101'
+                  : session.sceneSpec.executionOutcome === 'no_robot'
+                    ? '◎ Scene Map'
+                    : '✕ Failure Detected'}
+            </span>
+          </>
+        )}
+        {session.mobileSensors && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="font-mono-tabular text-cyan-300">
+              IMU{session.mobileSensors.tapTarget ? ' + Tap' : ''}
+              {session.mobileSensors.hasAudioTrack ? ' + Audio' : ''}
             </span>
           </>
         )}
@@ -157,8 +186,21 @@ export const SessionExportBar: React.FC<SessionExportBarProps> = ({
         </span>
       </div>
 
-      {/* Prominent Export Control with Format Menu */}
+      {/* Prominent Regression CI Promote & Export Controls */}
       <div ref={menuContainerRef} className="relative flex items-center gap-2 shrink-0">
+        {onPromoteToRegressionCi && (
+          <button
+            type="button"
+            disabled={!hasCompiledScene || isPromotingRegression}
+            onClick={() => void onPromoteToRegressionCi()}
+            title="Save this calibrated failure scene into your permanent Regression CI suite"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-cyan-200 bg-[#161D2C] border border-cyan-500/40 rounded-md hover:border-cyan-400 hover:text-cyan-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <GitBranch className="w-3.5 h-3.5" />
+            <span>{isPromotingRegression ? 'Saving CI...' : 'Save to CI'}</span>
+          </button>
+        )}
+
         <button
           type="button"
           onClick={() => runExportAction('json')}
@@ -240,6 +282,42 @@ export const SessionExportBar: React.FC<SessionExportBarProps> = ({
               </span>
               <span className="font-mono-tabular text-[11px] text-slate-400">.xml</span>
             </button>
+
+            {onOpenTrainingStudio && (
+              <>
+                <div className="my-1 border-t border-[#1E293B]" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onOpenTrainingStudio('gym_mjx');
+                  }}
+                  className="w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-[#161D2C] flex items-center justify-between gap-2 cursor-pointer"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Layers className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Gymnasium + MJX RL</span>
+                  </span>
+                  <span className="font-mono-tabular text-[11px] text-amber-300">.zip</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onOpenTrainingStudio('lerobot');
+                  }}
+                  className="w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-[#161D2C] flex items-center justify-between gap-2 cursor-pointer"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Database className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>LeRobot v2.1 Dataset</span>
+                  </span>
+                  <span className="font-mono-tabular text-[11px] text-cyan-300">.zip</span>
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>

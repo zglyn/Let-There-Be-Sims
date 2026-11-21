@@ -46,6 +46,7 @@ npm run build
 npm start
 ```
 
-## Architecture & Design
+## Architecture & Strategy
 
-See [Design.md](./Design.md) for full architecture, Gemini 4 stage chaining (`previous_interaction_id`), and telemetry specifications.
+- [Design.md](./Design.md) — System architecture, Gemini 4 stage chaining (`previous_interaction_id`), and telemetry specifications.
+- [Product_Strategy.md](./Product_Strategy.md) — Problem statement, competitive landscape, differentiation analysis, and roadmap.

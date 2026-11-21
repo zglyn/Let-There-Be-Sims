@@ -20,7 +20,6 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { APP_CONFIG, type RobotModelId } from './config/appConfig';
-import { BundleExportView } from './components/BundleExportView';
 import {
   CaptureIntakePanel,
   type LocalVideoMeta,
@@ -30,12 +29,14 @@ import { CloudSwarmView } from './components/CloudSwarmView';
 import { MobileCaptureView } from './components/MobileCaptureView';
 import { PipelineRail } from './components/PipelineRail';
 import { PolicyDiffView } from './components/PolicyDiffView';
+import { RegressionCiView } from './components/RegressionCiView';
 import { RobotStage3D } from './components/RobotStage3D';
 import { SessionExportBar } from './components/SessionExportBar';
 import { SpatialSceneMap } from './components/SpatialSceneMap';
 import { SwarmMatrix } from './components/SwarmMatrix';
 import { TelemetryChart } from './components/TelemetryChart';
 import { TopBar, type ActiveWorkspaceView } from './components/TopBar';
+import { TrainingExportView, type TrainingStudioTab } from './components/TrainingExportView';
 import {
   cancelPipelineRun,
   createCompilerSession,
@@ -43,6 +44,7 @@ import {
   openSessionEventStream,
   pollDeploymentBundle,
   removeSessionVideo,
+  saveSessionToRegressionSuite,
   saveWebhookConfig,
   testWebhookConnection,
   triggerPipelineRun,
@@ -74,6 +76,7 @@ export default function App() {
 
   const [session, setSession] = useState<CompilerSessionState | null>(null);
   const [activeView, setActiveView] = useState<ActiveWorkspaceView>('command_center');
+  const [trainingStudioTab, setTrainingStudioTab] = useState<TrainingStudioTab>('gym_mjx');
   const [taskGoal, setTaskGoal] = useState<string>(APP_CONFIG.simulation.defaultTaskGoal);
   const [robotModel, setRobotModel] = useState<RobotModelId>(APP_CONFIG.simulation.defaultRobotModel);
   const [durationMode, setDurationMode] = useState<RolloutDurationSelection>('match');
@@ -96,6 +99,7 @@ export default function App() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isRefreshingBundle, setIsRefreshingBundle] = useState(false);
+  const [isPromotingRegression, setIsPromotingRegression] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
 
@@ -223,11 +227,20 @@ export default function App() {
                   video: event.slot === 'primary' ? event.video : prev.video,
                   secondaryVideo:
                     event.slot === 'secondary' ? event.video : prev.secondaryVideo,
+                  mobileSensors:
+                    event.mobileSensors !== undefined ? event.mobileSensors : prev.mobileSensors,
+                  robotModel:
+                    event.mobileSensors?.captureMode === 'hand_demo'
+                      ? 'so_arm101'
+                      : prev.robotModel,
                   status: event.sessionStatus,
                   error: null,
                 }
               : prev,
           );
+          if (event.mobileSensors?.captureMode === 'hand_demo') {
+            setRobotModel('so_arm101');
+          }
           setUploadError(null);
           if (event.video.source === 'mobile_qr') {
             if (event.slot === 'secondary') {
@@ -235,7 +248,11 @@ export default function App() {
             } else {
               replaceLocalPreview(null, null);
             }
-            showToast(`Smartphone footage received (${event.video.originalName}).`);
+            showToast(
+              event.mobileSensors?.captureMode === 'hand_demo'
+                ? 'Mobile 6s hand demo + gravity vector + audio received — retargeting to SO-ARM101.'
+                : `Smartphone footage received (${event.video.originalName}).`,
+            );
           }
           break;
         case 'video_removed':
@@ -280,6 +297,11 @@ export default function App() {
           if (event.sceneSpec.sceneMode === 'scene_map_only') {
             setLowerPanelTab('spatial_map');
             showToast('No robot detected — simulation-ready 3D scene & 2D spatial map compiled.');
+          } else if (event.sceneSpec.sceneMode === 'hand_demo_retarget') {
+            setLowerPanelTab('swarm');
+            showToast(
+              'Hand demo retargeted to SO-ARM101 — running 20-env Hydrogen & Neon verification.',
+            );
           } else if (event.sceneSpec.sceneMode === 'robot_success_verification') {
             setLowerPanelTab('swarm');
             showToast('Successful demo detected — running 20-environment robustness stress test.');
@@ -598,6 +620,24 @@ export default function App() {
     }
   };
 
+  /**
+   * Promotes the current session's calibrated failure scene & fix into the
+   * persistent Failure-to-Regression-Suite CI bank.
+   */
+  const handlePromoteToRegressionCi = async (): Promise<void> => {
+    if (!session || !session.sceneSpec) return;
+    logFunctionCall('App.handlePromoteToRegressionCi', { sessionId: session.id });
+    setIsPromotingRegression(true);
+    try {
+      const { testCase } = await saveSessionToRegressionSuite({ sessionId: session.id });
+      showToast(`Saved "${testCase.name}" to Regression CI Suite.`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Unable to save to Regression CI.');
+    } finally {
+      setIsPromotingRegression(false);
+    }
+  };
+
   const activeIteration = session?.iterations[selectedIterationIndex] ?? null;
   const activeRollout =
     activeIteration?.rollouts.find((r) => r.envId === selectedEnvId) ??
@@ -695,6 +735,12 @@ export default function App() {
                   session={session}
                   robotModel={robotModel}
                   onExported={showToast}
+                  onPromoteToRegressionCi={handlePromoteToRegressionCi}
+                  isPromotingRegression={isPromotingRegression}
+                  onOpenTrainingStudio={(tab) => {
+                    setTrainingStudioTab(tab);
+                    setActiveView('bundle');
+                  }}
                 />
 
                 <RobotStage3D
@@ -814,6 +860,11 @@ export default function App() {
               />
             )}
 
+            {/* Contextual View: Failure-to-Regression-Suite CI/CD */}
+            {activeView === 'regression_ci' && (
+              <RegressionCiView session={session} onNotify={showToast} />
+            )}
+
             {/* Contextual View: External Cloud MuJoCo Swarm Connector */}
             {activeView === 'cloud_swarm' && (
               <CloudSwarmView
@@ -823,12 +874,14 @@ export default function App() {
               />
             )}
 
-            {/* Contextual View: Long Decode Deployment Bundle */}
+            {/* Contextual View: Robot Training Studio & Deployment Bundle */}
             {activeView === 'bundle' && (
-              <BundleExportView
-                bundle={session.bundle}
+              <TrainingExportView
+                session={session}
+                initialTab={trainingStudioTab}
                 onRefreshBundle={handleRefreshBundle}
-                isRefreshing={isRefreshingBundle}
+                isRefreshingBundle={isRefreshingBundle}
+                onNotify={showToast}
               />
             )}
           </>

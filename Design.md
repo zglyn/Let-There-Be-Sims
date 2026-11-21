@@ -44,11 +44,12 @@
 
 ### 2.4 Interactive Dynamic 3D Robot Simulation Stage (Three.js / WebGL)
 - Composite multi-part procedural **SO-ARM101** (and **Franka Panda**) articulated arms with wrist-mounted optical camera modules mounted on a dynamically scaled calibrated metric workbench with `RoomEnvironment` PBR lighting, warm/cool 3-point lighting, and software-WebGL pacing guards.
-- **Real-Time Dynamic Physics & 6-DOF IK Sandbox (`livePhysicsSandbox.ts`):**
-  - Continuously runs a frame-rate-independent rigid-body + analytical 6-DOF inverse-kinematics pick-descend-grasp-lift-hold-return loop right on load (and toggleable anytime via **Live** / **Replay** once rollout iterations complete).
+- **Complete Pick-Lift-Transport-Place Task Execution & Goal Placement Pad (`taskGoalResolver.ts`, `livePhysicsSandbox.ts`, `physicsEvaluator.ts`):**
+  - Resolves a deterministic, obstacle-free **Goal Placement Pad** (`clear_zone` preference or open opposite tabletop zone within safe arm reach) shared identically by the backend 20-environment physics evaluator, the browser's real-time 6-DOF IK sandbox, and the 3D workbench Goal Pad reticle.
+  - Executes the complete 8-phase manipulation task (`Approach → Descend → Grasp → Lift → Transport over obstacles → Controlled Place & Release on Goal Pad → Retract → Task Complete ✓`) in both Live Physics mode and Replay mode, glowing bright emerald with a completion shockwave pulse when the object is cleanly placed at the destination.
   - **Direct 3D Tabletop Drag-and-Drop (`stageInteractionController.ts`):** Raycast hover highlighting and ray-plane tabletop dragging let users grab and reposition the target object or any obstacle directly in 3D space (automatically handing off `OrbitControls` and transitioning into Live Physics mode) to test tighter obstacle corridors, collisions, and real-time IK re-planning.
   - **Live Impulse & Physics Tuning:** Built-in **Nudge** button imparts horizontal velocity and angular wobble onto the target object under Coulomb friction and gravity, while an inline **Physics** drawer inside the bottom HUD dock exposes live **Friction (μ)**, **Mass (kg)**, **Clearance (cm)** sliders, and **Reset Scene**.
-  - **Dynamic Visual Telemetry:** Recomputes the 3D approach spline in real time as objects move, dynamically scales the tabletop to match Carbon's calibrated `tableDimensions`, animates expanding contact-impact shockwave rings on force spikes (`> 45 N` fault in rose, normal contact in amber), and supports an **Expand / Compact** height toggle (`480px` ↔ `660px`).
+  - **Dynamic Visual Telemetry:** Recomputes the full pickup-to-goal 3D spline in real time as objects move, dynamically scales the tabletop to match Carbon's calibrated `tableDimensions`, animates expanding shockwave rings on contact/collision/task-completion events, and supports an **Expand / Compact** height toggle (`480px` ↔ `660px`).
 - **Full-Clip & 1-Minute Rollout Durations + 3D Video Clip Export (`stageVideoRecorder.ts`):**
   - Automatically detects the uploaded video's real duration (`Full Clip` mode, clamped cleanly to `3s–120s`) or lets the user select explicit **`15s`**, **`30s`**, or **`60s (1m)`** rollout lengths before compiling, executing continuous multi-cycle pick-lift-transport-place-return trajectories in true real-time playback with dynamic `TelemetryChart` time axes.
   - Built-in **Record** control in the bottom HUD dock captures the live Three.js WebGL canvas at 30 FPS (`video/webm`) for **`15s`**, **`30s`**, **`60s (1 min)`**, or the full rollout duration and downloads the video clip automatically.
@@ -63,11 +64,28 @@
 - Interactive 5×4 matrix (`E01`–`E20`) displaying each environment's pass/fail status with explicit text/glyph indicators, peak contact force (`N`), and final lift height (`m`), with `All` / `Failed` / `Passed` filtering and iteration switching.
 - Synchronized SVG dual-axis telemetry chart plotting Contact Force (`N`, with `45.0 N` safety ceiling) and Object Z-Height (`m`, with `0.12 m` target threshold) with an interactive hover crosshair.
 
-### 2.6 Contextual Inspection Views & One-Click Export
-- **Command Center Export Bar:** Provides an always-accessible `Export` button directly above the 3D stage to download the full session snapshot (`.json`), the 20-environment swarm telemetry table (`.csv`), the latest verified Python policy (`.py`), or the compiled MuJoCo scene (`.mjcf.xml`).
+### 2.6 Failure-to-Regression-Suite CI/CD ("`pytest` for Physical Robots") & Contextual Views
+- **Failure-to-Regression-Suite CI/CD (`regressionSuiteStore.ts`, `RegressionCiView.tsx`):**
+  - Automatically promotes completed real-world failure repairs (or any compiled session via **Save to CI**) into a disk-persisted regression bank (`GET/POST/DELETE /api/regression/cases`).
+  - Runs the full CI gate (`POST /api/regression/run`) across every saved failure case × 20 domain-randomized environments against the active session's policy, stored verified patches, or unpatched baselines—returning `ciExitCode: 0 (PASS)` or `1 (FAIL)` and logging chronological build history.
+  - Generates ready-to-commit `.github/workflows/robotics-regression.yml`, `tests/test_robotics_regression.py`, and `tests/regression_suite_manifest.json` (`GET /api/regression/ci-bundle`) with one-click Copy & Download.
+- **Command Center Export Bar:** Provides always-accessible **Save to CI** and **Export** buttons directly above the 3D stage to promote failures to CI or download the full session snapshot (`.json`), the 20-environment swarm telemetry table (`.csv`), the latest verified Python policy (`.py`), or the compiled MuJoCo scene (`.mjcf.xml`).
 - **Policy Diff & MJCF XML Inspector:** Line-by-line diff comparing previous and patched Python controllers alongside Neon's root-cause explanation and Carbon's compiled MuJoCo XML.
 - **Cloud Swarm Webhook Connector:** Allows connecting an external HTTPS Modal or Cloud Run MuJoCo swarm worker with server-side URL safety validation, connection tester, and ready-to-copy Modal endpoint schema.
 - **Deployment Bundle Exporter:** Polls asynchronous Long Decode progress and provides one-click `.py`, `.xml`, and `.md` downloads.
+
+### 2.7 Robot Training & Export Studio (`Train & Export` Tab)
+- **Exportable Gymnasium + MuJoCo MJX RL Training Package (`gymMjxExporter.ts`, `zipBuilder.ts`, `TrainingExportView.tsx`):**
+  - Generates a complete, runnable RL training bundle from either the active session or any saved Regression CI case (`POST /api/training/gym-mjx/preview` and `/download`).
+  - Bundles 6 calibrated files into a single standard `.zip` archive: RL-ready `scene.mjcf.xml` (articulated actuators, Goal Placement Pad site, wrist/overhead cameras, end-effector force sensors), `env.py` (`gymnasium.Env` with 29-D observations, 7-D continuous actions, selectable reward presets, and domain randomization), `mjx_env.py` (GPU-vectorized JAX `mujoco.mjx` via `jax.vmap`/`jax.jit`), `train_rl.py` (Stable-Baselines3 PPO/SAC trainer, MJX throughput harness, and calibrated 20-env evaluator), `requirements.txt`, and `README.md`.
+- **Synthetic LeRobot v2.1 Episode Dataset Generator (`lerobotDatasetGenerator.ts`):**
+  - Rolls out 10–100+ domain-randomized pick-lift-transport-place trajectories through the calibrated rigid-body physics and 6-DOF IK solver (`POST /api/training/lerobot/preview` and `/download`), automatically filtering failed episodes and computing per-feature LeRobot v2.1 normalization statistics (`min`, `max`, `mean`, `std`).
+  - Packages `meta/info.json`, `meta/tasks.jsonl`, `meta/episodes.jsonl`, `meta/episodes_stats.jsonl`, per-episode trajectory CSVs (`data/chunk-000/episode_XXXXXX.csv`), `scene.mjcf.xml`, `scripts/build_parquet_and_videos.py` (converts CSVs to native Parquet + renders synchronized MuJoCo wrist/overhead `.mp4` cameras), `scripts/train_lerobot.sh` (tailored for ACT, Diffusion Policy, or SmolVLA), and Hugging Face `README.md` dataset card into a downloadable `.zip`.
+
+### 2.8 QR Judge 6-Second Hand-Demo Retargeting (`MobileCaptureView.tsx`, `mobileSensorCapture.ts`)
+- **Tap-to-Select Target Reticle:** Scanning the desktop QR code opens `/capture?session=<id>`, where a judge taps directly on an object in the live rear-camera viewfinder to lock normalized `(tapX, tapY)` coordinates.
+- **DeviceOrientation Gravity Vector + Live Microphone Audio:** Samples real `DeviceOrientationEvent` / `DeviceMotionEvent` gravity vectors `(gx, gy, gz)` (with iOS 13+ permission handling and live horizon tilt readout) alongside a live microphone audio track (`audio: true` + Web Audio RMS meter) during a 6.0-second auto-stop recording.
+- **Audio-Preserving Analysis Proxy & Carbon Retargeting:** Preserves the 32 kbps mono AAC audio track in `videoTranscoder.ts` (at 2 FPS for short clips) and injects the tap coordinates, averaged gravity vector, and audio cues into Gemini 4 Carbon, which builds the MuJoCo scene, retargets the human hand obstacle-avoidance arc (`pickupPos → apexWaypointPos → placePos`) onto **SO-ARM101** (`sceneMode: 'hand_demo_retarget'`), anchors the 3D Goal Placement Pad to `placePos`, and immediately launches Hydrogen (20 randomized rollouts) + Neon (`xhigh`) to fix slip/collision failures until 20/20 complete the demonstration reliably.
 
 ---
 

@@ -29,6 +29,7 @@ import type {
   Vector3Tuple,
 } from '../types/robotics';
 import { logFunctionCall } from '../utils/logger';
+import { resolveTaskGoalPose } from '../utils/taskGoalResolver';
 
 /**
  * Clamps a numeric value to the inclusive [min, max] range.
@@ -83,7 +84,7 @@ function solveArmIK(
  * 60-second 1-minute episode) and returns contact force, slip, lift height,
  * failure mode diagnostics, and synchronized 3D kinematics frames.
  */
-function simulateSingleEnvironment(
+export function simulateSingleEnvironment(
   sceneSpec: SceneSpec,
   rand: DomainRandomizationParam,
   ctrl: ControllerParams,
@@ -198,15 +199,14 @@ function simulateSingleEnvironment(
     finalObjectZ >= APP_CONFIG.simulation.targetLiftZMeters &&
     peakContactForceN <= APP_CONFIG.simulation.maxSafeContactForceN;
 
-  // Build synchronized 3D kinematic frames spanning the entire rollout duration.
-  // Short rollouts (<= 7.5s) perform one full pick-and-lift cycle; longer
-  // rollouts (e.g. 15s, 30s, 60s) execute continuous pick-lift-transport-place-return
-  // cycles across the full clip duration.
+  // Resolve the exact obstacle-free Goal Placement Pad so replay matches the 3D Goal Zone
+  const resolvedGoal = resolveTaskGoalPose(sceneSpec);
   const trajectory: TrajectoryFrame[] = [];
   const homePos: Vector3Tuple = { x: 0.14, y: 0.28, z: 0.0 };
   const preGraspY = Math.max(restObjY + 0.08, ctrl.approachHeightM + ctrl.clearanceArcM);
-  const cycleCount = totalTimeSec <= 7.5 ? 1 : Math.max(2, Math.round(totalTimeSec / 6.0));
-  const placeSign = objZ >= 0 ? -1 : 1;
+  const maxObsH = sceneSpec.obstacles.reduce((m, o) => Math.max(m, o.dimensions.y), 0.08);
+  const transportY = Math.max(restObjY + targetLift, maxObsH + 0.065);
+  const cycleCount = totalTimeSec <= 8.5 ? 1 : Math.max(2, Math.round(totalTimeSec / 6.5));
 
   for (let i = 0; i < frameCount; i++) {
     const globalU = i / (frameCount - 1);
@@ -215,223 +215,190 @@ function simulateSingleEnvironment(
     const cycleIdx = Math.min(cycleCount - 1, Math.floor(cycleFloat));
     const u = cycleCount === 1 ? globalU : cycleFloat - cycleIdx;
 
-    // Slight deterministic per-cycle lateral transport shift on multi-cycle clips
-    const cycleWave = cycleCount === 1 ? 0 : Math.sin(cycleIdx * 1.15);
-    const cycleObjX = clamp(objX + cycleWave * 0.014, 0.12, 0.36);
-    const cycleObjZ = clamp(objZ + placeSign * (cycleIdx % 2 === 1 ? 0.04 : 0), -0.22, 0.22);
-    const destObjZ = clamp(cycleObjZ + placeSign * 0.045, -0.22, 0.22);
+    // On multi-cycle rollouts, alternate cleanly Pickup -> Goal Pad -> Pickup -> Goal Pad
+    // so every cycle visually completes a full pick-and-place transport across the tabletop.
+    const reverseCycle = cycleIdx % 2 === 1;
+    const startX = reverseCycle ? resolvedGoal.x : objX;
+    const startZ = reverseCycle ? resolvedGoal.z : objZ;
+    const destX = reverseCycle ? objX : resolvedGoal.x;
+    const destZ = reverseCycle ? objZ : resolvedGoal.z;
 
     const graspPos: Vector3Tuple = {
-      x: cycleObjX + ctrl.preGraspOffsetX * 0.25,
+      x: startX + ctrl.preGraspOffsetX * 0.25,
       y: restObjY + 0.015,
-      z: cycleObjZ + ctrl.preGraspOffsetY * 0.25,
+      z: startZ + ctrl.preGraspOffsetY * 0.25,
     };
     const liftPos: Vector3Tuple = {
-      x: cycleObjX,
-      y: restObjY + targetLift,
-      z: cycleCount === 1 ? cycleObjZ : (cycleObjZ + destObjZ) * 0.5,
+      x: startX,
+      y: transportY,
+      z: startZ,
+    };
+    const overGoalPos: Vector3Tuple = {
+      x: destX,
+      y: transportY,
+      z: destZ,
     };
     const placePos: Vector3Tuple = {
-      x: cycleObjX,
+      x: destX,
       y: restObjY + 0.016,
-      z: destObjZ,
+      z: destZ,
     };
 
     let ee: Vector3Tuple;
     let gripperOpen = 1.0;
-    let objPos: Vector3Tuple = { x: cycleObjX, y: restObjY, z: cycleObjZ };
+    let objPos: Vector3Tuple = { x: startX, y: restObjY, z: startZ };
     let objectTiltRad = 0;
     let contactForceN = 0.0;
     let slipVel = 0.0;
 
-    if (cycleCount === 1) {
-      // Single-cycle episode (original 4-phase profile)
-      if (u < 0.3) {
-        const t = u / 0.3;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: homePos.x + (graspPos.x - homePos.x) * ease,
-          y: homePos.y + (preGraspY - homePos.y) * ease + Math.sin(t * Math.PI) * ctrl.clearanceArcM,
-          z: homePos.z + (graspPos.z - homePos.z) * ease,
-        };
-        gripperOpen = 1.0;
-      } else if (u < 0.55) {
-        const t = (u - 0.3) / 0.25;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: graspPos.x,
-          y: preGraspY + (graspPos.y - preGraspY) * ease,
-          z: graspPos.z,
-        };
-        gripperOpen = 1.0;
-        if (t > 0.7) {
-          const contactRamp = (t - 0.7) / 0.3;
-          contactForceN = collisionFailure
-            ? peakContactForceN * contactRamp
-            : nominalContactForce * 0.5 * contactRamp;
-        }
-        if (collisionFailure && t > 0.82) {
-          const knock = (t - 0.82) / 0.18;
-          objPos = {
-            x: cycleObjX + knock * 0.04,
-            y: restObjY * (1 - knock * 0.35),
-            z: cycleObjZ + knock * 0.03,
-          };
-          objectTiltRad = knock * 1.15;
-        }
-      } else if (u < 0.72) {
-        const t = (u - 0.55) / 0.17;
-        ee = { ...graspPos };
-        gripperOpen = clamp(1 - t * 0.78, 0.22, 1);
+    if (u < 0.18) {
+      // 1) Approach arc above pickup
+      const t = u / 0.18;
+      const ease = t * t * (3 - 2 * t);
+      ee = {
+        x: homePos.x + (graspPos.x - homePos.x) * ease,
+        y: homePos.y + (preGraspY - homePos.y) * ease + Math.sin(t * Math.PI) * ctrl.clearanceArcM,
+        z: homePos.z + (graspPos.z - homePos.z) * ease,
+      };
+      gripperOpen = 1.0;
+    } else if (u < 0.32) {
+      // 2) Controlled descent to target
+      const t = (u - 0.18) / 0.14;
+      const ease = t * t * (3 - 2 * t);
+      ee = {
+        x: graspPos.x,
+        y: preGraspY + (graspPos.y - preGraspY) * ease,
+        z: graspPos.z,
+      };
+      gripperOpen = 1.0;
+      if (t > 0.68) {
+        const contactRamp = (t - 0.68) / 0.32;
         contactForceN = collisionFailure
-          ? peakContactForceN * (1 - t * 0.35)
-          : nominalContactForce + (peakContactForceN - nominalContactForce) * Math.sin(t * Math.PI);
-        if (collisionFailure) {
-          objPos = { x: cycleObjX + 0.055, y: restObjY * 0.55, z: cycleObjZ + 0.045 };
-          objectTiltRad = 1.35;
-        }
-      } else {
-        const t = (u - 0.72) / 0.28;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: graspPos.x + (liftPos.x - graspPos.x) * ease,
-          y: graspPos.y + (liftPos.y - graspPos.y) * ease,
-          z: graspPos.z + (liftPos.z - graspPos.z) * ease,
-        };
-        gripperOpen = 0.22;
-
-        if (collisionFailure) {
-          objPos = { x: cycleObjX + 0.06, y: restObjY * 0.55, z: cycleObjZ + 0.05 };
-          objectTiltRad = 1.42;
-          contactForceN = 2.1;
-        } else if (slipFailure) {
-          const rise = t < 0.42 ? t / 0.42 : Math.max(0, 1 - (t - 0.42) / 0.38);
-          objPos = {
-            x: cycleObjX + (t > 0.42 ? (t - 0.42) * 0.025 : 0),
-            y: restObjY + targetLift * 0.34 * rise,
-            z: cycleObjZ,
-          };
-          objectTiltRad = t > 0.42 ? (t - 0.42) * 0.55 : 0;
-          contactForceN = nominalContactForce * (t < 0.5 ? 0.85 : 0.15);
-          slipVel = t > 0.3 && t < 0.75 ? maxSlipVelocityMs : 0.01;
-        } else {
-          objPos = {
-            x: ee.x,
-            y: ee.y - 0.015,
-            z: ee.z,
-          };
-          contactForceN = Number(
-            (nominalContactForce * (0.92 + 0.08 * Math.cos(t * Math.PI * 2))).toFixed(2),
-          );
-          slipVel = Number((maxSlipVelocityMs * 0.35).toFixed(4));
-        }
+          ? peakContactForceN * contactRamp
+          : nominalContactForce * 0.55 * contactRamp;
       }
-    } else {
-      // Multi-cycle continuous manipulation episode (approach -> descend -> grasp -> lift & transport -> place -> return)
-      const isLastCycle = cycleIdx === cycleCount - 1;
-      if (u < 0.22) {
-        const t = u / 0.22;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: homePos.x + (graspPos.x - homePos.x) * ease,
-          y: homePos.y + (preGraspY - homePos.y) * ease + Math.sin(t * Math.PI) * ctrl.clearanceArcM,
-          z: homePos.z + (graspPos.z - homePos.z) * ease,
+      if (collisionFailure && t > 0.8) {
+        const knock = (t - 0.8) / 0.2;
+        objPos = {
+          x: startX + knock * 0.04,
+          y: restObjY * (1 - knock * 0.35),
+          z: startZ + knock * 0.03,
         };
-        gripperOpen = 1.0;
-      } else if (u < 0.4) {
-        const t = (u - 0.22) / 0.18;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: graspPos.x,
-          y: preGraspY + (graspPos.y - preGraspY) * ease,
-          z: graspPos.z,
-        };
-        gripperOpen = 1.0;
-        if (t > 0.68) {
-          const contactRamp = (t - 0.68) / 0.32;
-          contactForceN = collisionFailure
-            ? peakContactForceN * contactRamp
-            : nominalContactForce * 0.55 * contactRamp;
-        }
-        if (collisionFailure && t > 0.8) {
-          const knock = (t - 0.8) / 0.2;
-          objPos = {
-            x: cycleObjX + knock * 0.04,
-            y: restObjY * (1 - knock * 0.35),
-            z: cycleObjZ + knock * 0.03,
-          };
-          objectTiltRad = knock * 1.15;
-        }
-      } else if (u < 0.52) {
-        const t = (u - 0.4) / 0.12;
-        ee = { ...graspPos };
-        gripperOpen = clamp(1 - t * 0.78, 0.22, 1);
-        contactForceN = collisionFailure
-          ? peakContactForceN * (1 - t * 0.35)
-          : nominalContactForce + (peakContactForceN - nominalContactForce) * Math.sin(t * Math.PI);
-        if (collisionFailure) {
-          objPos = { x: cycleObjX + 0.055, y: restObjY * 0.55, z: cycleObjZ + 0.045 };
-          objectTiltRad = 1.35;
-        }
-      } else if (u < 0.76 || isLastCycle) {
-        const span = isLastCycle ? 0.48 : 0.24;
-        const t = clamp((u - 0.52) / span, 0, 1);
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: graspPos.x + (liftPos.x - graspPos.x) * ease,
-          y: graspPos.y + (liftPos.y - graspPos.y) * ease,
-          z: graspPos.z + (liftPos.z - graspPos.z) * ease,
-        };
-        gripperOpen = 0.22;
+        objectTiltRad = knock * 1.15;
+      }
+    } else if (u < 0.42) {
+      // 3) Compliant gripper close
+      const t = (u - 0.32) / 0.1;
+      ee = { ...graspPos };
+      gripperOpen = clamp(1 - t * 0.78, 0.22, 1);
+      contactForceN = collisionFailure
+        ? peakContactForceN * (1 - t * 0.35)
+        : nominalContactForce + (peakContactForceN - nominalContactForce) * Math.sin(t * Math.PI);
+      if (collisionFailure) {
+        objPos = { x: startX + 0.055, y: restObjY * 0.55, z: startZ + 0.045 };
+        objectTiltRad = 1.35;
+      }
+    } else if (u < 0.56) {
+      // 4) Vertical lift to clearance height
+      const t = (u - 0.42) / 0.14;
+      const ease = t * t * (3 - 2 * t);
+      ee = {
+        x: graspPos.x + (liftPos.x - graspPos.x) * ease,
+        y: graspPos.y + (liftPos.y - graspPos.y) * ease,
+        z: graspPos.z + (liftPos.z - graspPos.z) * ease,
+      };
+      gripperOpen = 0.22;
 
-        if (collisionFailure) {
-          objPos = { x: cycleObjX + 0.06, y: restObjY * 0.55, z: cycleObjZ + 0.05 };
-          objectTiltRad = 1.42;
-          contactForceN = 2.1;
-        } else if (slipFailure) {
-          const rise = t < 0.42 ? t / 0.42 : Math.max(0, 1 - (t - 0.42) / 0.38);
-          objPos = {
-            x: cycleObjX + (t > 0.42 ? (t - 0.42) * 0.025 : 0),
-            y: restObjY + targetLift * 0.34 * rise,
-            z: cycleObjZ,
-          };
-          objectTiltRad = t > 0.42 ? (t - 0.42) * 0.55 : 0;
-          contactForceN = nominalContactForce * (t < 0.5 ? 0.85 : 0.15);
-          slipVel = t > 0.3 && t < 0.75 ? maxSlipVelocityMs : 0.01;
-        } else {
-          objPos = { x: ee.x, y: ee.y - 0.015, z: ee.z };
-          contactForceN = Number(
-            (nominalContactForce * (0.9 + 0.1 * Math.cos(t * Math.PI * 2 + cycleIdx))).toFixed(2),
-          );
-          slipVel = Number((maxSlipVelocityMs * 0.35).toFixed(4));
-        }
-      } else if (u < 0.88) {
-        // Controlled place-down before next cycle
-        const t = (u - 0.76) / 0.12;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: liftPos.x + (placePos.x - liftPos.x) * ease,
-          y: liftPos.y + (placePos.y - liftPos.y) * ease,
-          z: liftPos.z + (placePos.z - liftPos.z) * ease,
+      if (collisionFailure) {
+        objPos = { x: startX + 0.06, y: restObjY * 0.55, z: startZ + 0.05 };
+        objectTiltRad = 1.42;
+        contactForceN = 2.1;
+      } else if (slipFailure) {
+        const rise = t < 0.45 ? t / 0.45 : Math.max(0, 1 - (t - 0.45) / 0.45);
+        objPos = {
+          x: startX + (t > 0.45 ? (t - 0.45) * 0.03 : 0),
+          y: restObjY + targetLift * 0.34 * rise,
+          z: startZ,
         };
-        gripperOpen = t > 0.78 ? clamp(0.22 + ((t - 0.78) / 0.22) * 0.78, 0.22, 1) : 0.22;
-        if (!collisionFailure && !slipFailure) {
-          objPos = { x: ee.x, y: Math.max(restObjY, ee.y - 0.015), z: ee.z };
-          contactForceN = nominalContactForce * (1 - t * 0.65);
-        }
+        objectTiltRad = t > 0.45 ? (t - 0.45) * 0.65 : 0;
+        contactForceN = nominalContactForce * (t < 0.5 ? 0.85 : 0.15);
+        slipVel = t > 0.3 ? maxSlipVelocityMs : 0.01;
       } else {
-        // Smooth retreat to home clearance height before next cycle
-        const t = (u - 0.88) / 0.12;
-        const ease = t * t * (3 - 2 * t);
-        ee = {
-          x: placePos.x + (homePos.x - placePos.x) * ease,
-          y: placePos.y + (homePos.y - placePos.y) * ease,
-          z: placePos.z + (homePos.z - placePos.z) * ease,
-        };
-        gripperOpen = 1.0;
-        objPos = { x: placePos.x, y: restObjY, z: placePos.z };
+        objPos = { x: ee.x, y: ee.y - 0.015, z: ee.z };
+        contactForceN = Number((nominalContactForce * 0.96).toFixed(2));
+        slipVel = Number((maxSlipVelocityMs * 0.35).toFixed(4));
+      }
+    } else if (u < 0.76) {
+      // 5) Parabolic obstacle-clearing transport across tabletop to Goal Placement Pad
+      const t = (u - 0.56) / 0.2;
+      const ease = t * t * (3 - 2 * t);
+      const arcBoost = Math.sin(t * Math.PI) * (ctrl.clearanceArcM * 0.45 + 0.02);
+      ee = {
+        x: liftPos.x + (overGoalPos.x - liftPos.x) * ease,
+        y: liftPos.y + arcBoost,
+        z: liftPos.z + (overGoalPos.z - liftPos.z) * ease,
+      };
+      gripperOpen = 0.22;
+
+      if (collisionFailure) {
+        objPos = { x: startX + 0.06, y: restObjY * 0.55, z: startZ + 0.05 };
+        objectTiltRad = 1.42;
+        contactForceN = 0;
+      } else if (slipFailure) {
+        objPos = { x: startX + 0.025, y: restObjY, z: startZ + 0.015 };
+        objectTiltRad = 0.48;
+        contactForceN = 0;
+        slipVel = maxSlipVelocityMs * 0.4;
+      } else {
+        objPos = { x: ee.x, y: ee.y - 0.015, z: ee.z };
+        contactForceN = Number(
+          (nominalContactForce * (0.9 + 0.08 * Math.cos(t * Math.PI * 2 + cycleIdx))).toFixed(2),
+        );
+        slipVel = Number((maxSlipVelocityMs * 0.3).toFixed(4));
+      }
+    } else if (u < 0.9) {
+      // 6) Controlled lower onto Goal Placement Pad + smooth release
+      const t = (u - 0.76) / 0.14;
+      const ease = t * t * (3 - 2 * t);
+      ee = {
+        x: overGoalPos.x + (placePos.x - overGoalPos.x) * ease,
+        y: overGoalPos.y + (placePos.y - overGoalPos.y) * ease,
+        z: overGoalPos.z + (placePos.z - overGoalPos.z) * ease,
+      };
+      gripperOpen = t > 0.74 ? clamp(0.22 + ((t - 0.74) / 0.26) * 0.78, 0.22, 1) : 0.22;
+      if (collisionFailure) {
+        objPos = { x: startX + 0.06, y: restObjY * 0.55, z: startZ + 0.05 };
+        objectTiltRad = 1.42;
+      } else if (slipFailure) {
+        objPos = { x: startX + 0.025, y: restObjY, z: startZ + 0.015 };
+        objectTiltRad = 0.48;
+      } else if (t <= 0.74) {
+        objPos = { x: ee.x, y: Math.max(restObjY, ee.y - 0.015), z: ee.z };
+        contactForceN = nominalContactForce * (1 - t * 0.65);
+      } else {
+        objPos = { x: destX, y: restObjY, z: destZ };
         contactForceN = 0;
       }
+    } else {
+      // 7) Clean retract to safe home posture with object resting on Goal Pad
+      const t = (u - 0.9) / 0.1;
+      const ease = t * t * (3 - 2 * t);
+      ee = {
+        x: placePos.x + (homePos.x - placePos.x) * ease,
+        y: placePos.y + (homePos.y - placePos.y) * ease,
+        z: placePos.z + (homePos.z - placePos.z) * ease,
+      };
+      gripperOpen = 1.0;
+      if (collisionFailure) {
+        objPos = { x: startX + 0.06, y: restObjY * 0.55, z: startZ + 0.05 };
+        objectTiltRad = 1.42;
+      } else if (slipFailure) {
+        objPos = { x: startX + 0.025, y: restObjY, z: startZ + 0.015 };
+        objectTiltRad = 0.48;
+      } else {
+        objPos = { x: destX, y: restObjY, z: destZ };
+      }
+      contactForceN = 0;
     }
 
     trajectory.push({
@@ -462,6 +429,8 @@ function simulateSingleEnvironment(
     peakContactForceN,
     maxSlipVelocityMs,
     durationSec: totalTimeSec,
+    taskCompleted: success,
+    placementErrorM: success ? 0.004 : Number(Math.hypot(resolvedGoal.x - objX, resolvedGoal.z - objZ).toFixed(3)),
     params: rand,
     trajectory,
     previewVideoUrl: null,

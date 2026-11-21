@@ -77,7 +77,11 @@ export async function buildAnalysisVideoProxy(
 
   const proxyName = `proxy_${Date.now()}_${crypto.randomBytes(5).toString('hex')}.mp4`;
   const proxyPath = resolveConfinedUploadPath(proxyName);
-  const vfFilter = `fps=${cfg.targetFps},scale='min(${cfg.maxWidthPx},iw)':-2`;
+  const effectiveFps =
+    stat.size <= APP_CONFIG.mobileHandDemo.shortClipMaxBytes
+      ? APP_CONFIG.mobileHandDemo.shortClipProxyFps
+      : cfg.targetFps;
+  const vfFilter = `fps=${effectiveFps},scale='min(${cfg.maxWidthPx},iw)':-2`;
 
   try {
     await execFileAsync(
@@ -90,15 +94,24 @@ export async function buildAnalysisVideoProxy(
         sourceFilePath,
         '-t',
         String(cfg.maxDurationSec),
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
         '-vf',
         vfFilter,
-        '-an',
         '-c:v',
         'libx264',
         '-preset',
         'ultrafast',
         '-crf',
         String(cfg.crf),
+        '-c:a',
+        'aac',
+        '-b:a',
+        `${APP_CONFIG.mobileHandDemo.proxyAudioBitrateKbps}k`,
+        '-ac',
+        '1',
         '-movflags',
         '+faststart',
         proxyPath,

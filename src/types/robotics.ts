@@ -31,11 +31,44 @@ export type StageStatus = 'idle' | 'active' | 'completed' | 'skipped' | 'error';
 export type SceneMode =
   | 'robot_failure_repair'
   | 'robot_success_verification'
+  | 'hand_demo_retarget'
   | 'scene_map_only';
 
-export type ExecutionOutcome = 'failure' | 'success' | 'no_robot';
+export type ExecutionOutcome = 'failure' | 'success' | 'hand_demo' | 'no_robot';
 
 export type VideoSlot = 'primary' | 'secondary';
+
+export interface MobileSensorCapture {
+  /** Normalized [0..1, 0..1] viewfinder coordinates where the judge tapped the target object. */
+  tapTarget: { x: number; y: number } | null;
+  /** Gravity vector in phone/camera frame (m/s^2) from DeviceOrientation/DeviceMotion. */
+  gravityVector: { x: number; y: number; z: number } | null;
+  /** Raw DeviceOrientation Euler angles in degrees plus derived camera elevation tilt. */
+  orientationDeg: {
+    alpha: number;
+    beta: number;
+    gamma: number;
+    cameraTiltDeg: number;
+  } | null;
+  /** True when the recorded mobile clip includes a live microphone audio track. */
+  hasAudioTrack: boolean;
+  /** Actual recorded clip duration in seconds (default 6s judge hand demo). */
+  clipDurationSec: number;
+  /** Capture intent selected on the mobile viewfinder. */
+  captureMode: 'hand_demo' | 'robot_footage' | 'scene_scan';
+  capturedAt: string;
+}
+
+export interface HandDemoRetargetSpec {
+  detected: boolean;
+  spokenInstructionTranscript: string;
+  retargetedRobot: string;
+  obstacleAvoidedName: string;
+  pickupPos: Vector3Tuple;
+  apexWaypointPos: Vector3Tuple;
+  placePos: Vector3Tuple;
+  retargetNotes: string;
+}
 
 export interface Vector3Tuple {
   x: number;
@@ -105,6 +138,7 @@ export interface SceneSpec {
   initialControllerPython: string;
   controllerParams: ControllerParams;
   randomizations: DomainRandomizationParam[];
+  handDemoRetarget?: HandDemoRetargetSpec | null;
 }
 
 export interface TrajectoryFrame {
@@ -126,6 +160,8 @@ export interface RolloutResult {
   peakContactForceN: number;
   maxSlipVelocityMs: number;
   durationSec?: number;
+  taskCompleted?: boolean;
+  placementErrorM?: number;
   params: DomainRandomizationParam;
   trajectory: TrajectoryFrame[];
   previewVideoUrl?: string | null;
@@ -218,6 +254,7 @@ export interface CompilerSessionState {
   rolloutDurationSec: number;
   video: UploadedVideoMeta | null;
   secondaryVideo: UploadedVideoMeta | null;
+  mobileSensors: MobileSensorCapture | null;
   webhook: WebhookConfig;
   stages: PipelineStageState[];
   progress: PipelineProgressState | null;
@@ -230,7 +267,13 @@ export interface CompilerSessionState {
 
 export type ServerStreamEvent =
   | { type: 'session_snapshot'; session: CompilerSessionState }
-  | { type: 'video_uploaded'; slot: VideoSlot; video: UploadedVideoMeta; sessionStatus: SessionStatus }
+  | {
+      type: 'video_uploaded';
+      slot: VideoSlot;
+      video: UploadedVideoMeta;
+      sessionStatus: SessionStatus;
+      mobileSensors?: MobileSensorCapture | null;
+    }
   | { type: 'video_removed'; slot: VideoSlot; sessionStatus: SessionStatus }
   | {
       type: 'stage_update';
@@ -244,3 +287,183 @@ export type ServerStreamEvent =
   | { type: 'bundle_update'; bundle: DeploymentBundle }
   | { type: 'pipeline_error'; message: string }
   | { type: 'pipeline_complete'; session: CompilerSessionState };
+
+export type RegressionRunMode =
+  | 'candidate_policy'
+  | 'suite_verified'
+  | 'suite_baseline';
+
+export interface RegressionCaseRunResult {
+  caseId: string;
+  caseName: string;
+  robotModel: RobotModelId;
+  passedEnvs: number;
+  totalEnvs: number;
+  status: 'pass' | 'fail';
+  worstContactForceN: number;
+  worstSlipVelocityMs: number;
+  minLiftHeightM: number;
+  tasksCompletedEnvs: number;
+  failureReasons: string[];
+  durationMs: number;
+}
+
+export interface RegressionTestCase {
+  id: string;
+  name: string;
+  createdAt: string;
+  sourceSessionId: string;
+  taskGoal: string;
+  robotModel: RobotModelId;
+  executionOutcome: ExecutionOutcome;
+  failureSummary: string;
+  tags: string[];
+  sceneSpec: SceneSpec;
+  baselineControllerParams: ControllerParams;
+  baselinePolicyCode: string;
+  verifiedControllerParams: ControllerParams;
+  verifiedPolicyCode: string;
+  lastRun: RegressionCaseRunResult | null;
+}
+
+export interface RegressionSuiteRunRecord {
+  runId: string;
+  executedAt: string;
+  mode: RegressionRunMode;
+  policyLabel: string;
+  totalCases: number;
+  passedCases: number;
+  failedCases: number;
+  totalEnvsPassed: number;
+  totalEnvsEvaluated: number;
+  overallStatus: 'pass' | 'fail';
+  ciExitCode: 0 | 1;
+  durationMs: number;
+  caseResults: RegressionCaseRunResult[];
+}
+
+export interface RegressionCiArtifacts {
+  githubWorkflowYaml: string;
+  pytestScriptPy: string;
+  manifestJson: string;
+  caseCount: number;
+  generatedAt: string;
+}
+
+export interface RegressionSuiteSnapshot {
+  cases: RegressionTestCase[];
+  runs: RegressionSuiteRunRecord[];
+}
+
+export type GymRlAlgorithm = 'ppo' | 'sac' | 'mjx_ppo';
+export type GymRewardPreset = 'dense_pick_place' | 'force_safe_precision' | 'sparse_goal';
+export type GymRandomizationLevel = 'off' | 'standard' | 'aggressive';
+
+export interface GymMjxExportConfig {
+  sessionId?: string;
+  regressionCaseId?: string;
+  algorithm: GymRlAlgorithm;
+  rewardPreset: GymRewardPreset;
+  randomizationLevel: GymRandomizationLevel;
+  numEnvs: number;
+  totalTimesteps: number;
+}
+
+export interface TrainingPackageFile {
+  path: string;
+  label: string;
+  language: 'python' | 'xml' | 'json' | 'bash' | 'markdown' | 'text';
+  content: string;
+  sizeBytes: number;
+}
+
+export interface GymMjxPackageResponse {
+  packageName: string;
+  sourceLabel: string;
+  robotModel: RobotModelId;
+  taskGoal: string;
+  goalPad: { x: number; z: number; radiusM: number; label: string };
+  config: {
+    algorithm: GymRlAlgorithm;
+    rewardPreset: GymRewardPreset;
+    randomizationLevel: GymRandomizationLevel;
+    numEnvs: number;
+    totalTimesteps: number;
+    controlHz: number;
+    maxEpisodeSteps: number;
+  };
+  files: TrainingPackageFile[];
+  generatedAt: string;
+}
+
+export type LeRobotPolicyTarget = 'act' | 'diffusion' | 'smolvla';
+export type LeRobotRandomizationSpread = 'low' | 'medium' | 'high';
+
+export interface LeRobotDatasetConfig {
+  sessionId?: string;
+  regressionCaseId?: string;
+  episodeCount: number;
+  fps: number;
+  policyTarget: LeRobotPolicyTarget;
+  randomizationSpread: LeRobotRandomizationSpread;
+  includeFailedEpisodes: boolean;
+}
+
+export interface LeRobotEpisodeSummary {
+  episodeIndex: number;
+  lengthFrames: number;
+  durationSec: number;
+  passed: boolean;
+  friction: number;
+  massKg: number;
+  xyOffset: [number, number];
+  peakContactForceN: number;
+  maxSlipVelocityMs: number;
+  placementErrorM: number;
+  totalReward: number;
+}
+
+export interface LeRobotFeatureStat {
+  featureName: string;
+  shape: number[];
+  min: number[];
+  max: number[];
+  mean: number[];
+  std: number[];
+}
+
+export interface LeRobotSampleFrame {
+  frameIndex: number;
+  timestamp: number;
+  state: number[];
+  action: number[];
+  contactForceN: number;
+  reward: number;
+  done: boolean;
+}
+
+export interface LeRobotDatasetPreviewResponse {
+  datasetName: string;
+  repoIdSuggestion: string;
+  sourceLabel: string;
+  robotModel: RobotModelId;
+  taskGoal: string;
+  codebaseVersion: string;
+  fps: number;
+  policyTarget: LeRobotPolicyTarget;
+  randomizationSpread: LeRobotRandomizationSpread;
+  attemptedEpisodes: number;
+  exportedEpisodes: number;
+  filteredOutEpisodes: number;
+  totalFrames: number;
+  successRatePct: number;
+  meanPeakForceN: number;
+  meanPlacementErrorMm: number;
+  episodes: LeRobotEpisodeSummary[];
+  featureStats: LeRobotFeatureStat[];
+  sampleFrames: LeRobotSampleFrame[];
+  previewFiles: TrainingPackageFile[];
+  generatedAt: string;
+}
+
+

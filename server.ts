@@ -49,10 +49,40 @@ import {
   subscribeToSessionEvents,
 } from './src/server/sessionStore';
 import {
+  deleteRegressionCase,
+  generateRegressionCiArtifacts,
+  getRegressionCaseById,
+  getRegressionSuiteSnapshot,
+  runRegressionSuiteCi,
+  saveSessionAsRegressionCase,
+} from './src/server/regressionSuiteStore';
+import {
+  buildGymMjxTrainingPackage,
+  buildGymMjxZipArchive,
+  type GymMjxSourceInput,
+} from './src/server/gymMjxExporter';
+import {
+  buildLeRobotDatasetPreview,
+  buildLeRobotDatasetZip,
+  type LeRobotGeneratorInput,
+} from './src/server/lerobotDatasetGenerator';
+import {
   testExternalWebhook,
   validateExternalWebhookUrl,
 } from './src/server/webhookValidator';
-import type { UploadedVideoMeta, VideoSlot } from './src/types/robotics';
+import type {
+  ControllerParams,
+  GymRandomizationLevel,
+  GymRewardPreset,
+  GymRlAlgorithm,
+  LeRobotPolicyTarget,
+  LeRobotRandomizationSpread,
+  MobileSensorCapture,
+  RegressionRunMode,
+  SceneSpec,
+  UploadedVideoMeta,
+  VideoSlot,
+} from './src/types/robotics';
 import { logFunctionCall } from './src/utils/logger';
 
 /**
@@ -222,6 +252,70 @@ async function startServer(): Promise<void> {
     },
   );
 
+  /**
+   * Validates and clamps optional smartphone tap-target, DeviceOrientation
+   * gravity vector, and audio-track metadata submitted with mobile captures.
+   */
+  const sanitizeMobileSensors = (raw: unknown): MobileSensorCapture | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const obj = raw as Record<string, unknown>;
+    const clampNum = (v: unknown, min: number, max: number, fallback: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : fallback;
+
+    const rawTap = obj.tapTarget as Record<string, unknown> | null | undefined;
+    const tapTarget =
+      rawTap && typeof rawTap === 'object' && typeof rawTap.x === 'number' && typeof rawTap.y === 'number'
+        ? {
+            x: Number(clampNum(rawTap.x, 0, 1, 0.5).toFixed(4)),
+            y: Number(clampNum(rawTap.y, 0, 1, 0.5).toFixed(4)),
+          }
+        : null;
+
+    const rawGrav = obj.gravityVector as Record<string, unknown> | null | undefined;
+    const gravityVector =
+      rawGrav &&
+      typeof rawGrav === 'object' &&
+      typeof rawGrav.x === 'number' &&
+      typeof rawGrav.y === 'number' &&
+      typeof rawGrav.z === 'number'
+        ? {
+            x: Number(clampNum(rawGrav.x, -25, 25, 0).toFixed(3)),
+            y: Number(clampNum(rawGrav.y, -25, 25, -6.9).toFixed(3)),
+            z: Number(clampNum(rawGrav.z, -25, 25, -6.9).toFixed(3)),
+          }
+        : null;
+
+    const rawOri = obj.orientationDeg as Record<string, unknown> | null | undefined;
+    const orientationDeg =
+      rawOri && typeof rawOri === 'object'
+        ? {
+            alpha: Number(clampNum(rawOri.alpha, -360, 360, 0).toFixed(1)),
+            beta: Number(clampNum(rawOri.beta, -180, 180, 45).toFixed(1)),
+            gamma: Number(clampNum(rawOri.gamma, -90, 90, 0).toFixed(1)),
+            cameraTiltDeg: Number(clampNum(rawOri.cameraTiltDeg, -90, 90, 45).toFixed(1)),
+          }
+        : null;
+
+    const rawMode = String(obj.captureMode ?? 'hand_demo');
+    const captureMode: MobileSensorCapture['captureMode'] =
+      rawMode === 'robot_footage' || rawMode === 'scene_scan' ? rawMode : 'hand_demo';
+
+    return {
+      tapTarget,
+      gravityVector,
+      orientationDeg,
+      hasAudioTrack: Boolean(obj.hasAudioTrack),
+      clipDurationSec: Number(
+        clampNum(obj.clipDurationSec, 1, 120, APP_CONFIG.mobileHandDemo.defaultClipDurationSec).toFixed(1),
+      ),
+      captureMode,
+      capturedAt:
+        typeof obj.capturedAt === 'string' && obj.capturedAt.trim()
+          ? obj.capturedAt
+          : new Date().toISOString(),
+    };
+  };
+
   // 4c. Chunked Binary Upload — Step 3: Finalize & Broadcast SSE Event
   app.post('/api/sessions/:id/upload/complete', (req, res) => {
     logFunctionCall('POST /api/sessions/:id/upload/complete', { id: req.params.id });
@@ -232,11 +326,27 @@ async function startServer(): Promise<void> {
     }
 
     try {
-      const body = (req.body ?? {}) as { uploadId?: string; autoStart?: boolean };
+      const body = (req.body ?? {}) as {
+        uploadId?: string;
+        autoStart?: boolean;
+        mobileSensors?: unknown;
+      };
       const { filePath, videoMeta, slot } = finalizeChunkedUpload({
         sessionId: record.state.id,
         uploadId: String(body.uploadId ?? ''),
       });
+
+      const mobileSensors = sanitizeMobileSensors(body.mobileSensors);
+      if (mobileSensors) {
+        record.state.mobileSensors = mobileSensors;
+        if (mobileSensors.captureMode === 'hand_demo') {
+          record.state.robotModel = 'so_arm101';
+          record.state.rolloutDurationSec = Math.max(
+            APP_CONFIG.simulation.minRolloutDurationSec,
+            Math.round(mobileSensors.clipDurationSec),
+          );
+        }
+      }
 
       if (slot === 'secondary') {
         record.secondaryVideoFilePath = filePath;
@@ -258,6 +368,7 @@ async function startServer(): Promise<void> {
         slot,
         video: videoMeta,
         sessionStatus: record.state.status,
+        mobileSensors: record.state.mobileSensors,
       });
 
       if (Boolean(body.autoStart) && record.state.video && !record.isPipelineRunning) {
@@ -566,6 +677,337 @@ async function startServer(): Promise<void> {
       const message = err instanceof Error ? err.message : 'Failed to refresh Long Decode bundle.';
       res.status(502).json({ error: message });
     }
+  });
+
+  // 10. Failure-to-Regression-Suite CI/CD: List Saved Cases & CI Build History
+  app.get('/api/regression/cases', (_req, res) => {
+    logFunctionCall('GET /api/regression/cases');
+    const snapshot = getRegressionSuiteSnapshot();
+    res.json(snapshot);
+  });
+
+  // 10b. Promote Active Session Failure/Scene into Permanent Regression Test Case
+  app.post('/api/regression/cases', (req, res) => {
+    logFunctionCall('POST /api/regression/cases', { sessionId: req.body?.sessionId });
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+    const customName = typeof req.body?.name === 'string' ? req.body.name : undefined;
+    const customTags = Array.isArray(req.body?.tags)
+      ? req.body.tags.filter((t: unknown): t is string => typeof t === 'string')
+      : undefined;
+
+    const record = getSessionRecord(sessionId);
+    if (!record) {
+      res.status(404).json({ error: 'Active session not found.' });
+      return;
+    }
+    try {
+      const testCase = saveSessionAsRegressionCase({
+        session: record.state,
+        customName,
+        customTags,
+      });
+      res.status(201).json({ ok: true, testCase, suite: getRegressionSuiteSnapshot() });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Unable to save regression test case.',
+      });
+    }
+  });
+
+  // 10c. Delete a Saved Regression Test Case
+  app.delete('/api/regression/cases/:caseId', (req, res) => {
+    logFunctionCall('DELETE /api/regression/cases/:caseId', { caseId: req.params.caseId });
+    const removed = deleteRegressionCase(req.params.caseId);
+    if (!removed) {
+      res.status(404).json({ error: 'Regression test case not found.' });
+      return;
+    }
+    res.json({ ok: true, suite: getRegressionSuiteSnapshot() });
+  });
+
+  // 10d. Run Full Regression Suite CI Gate (returns ciExitCode 0 = PASS, 1 = FAIL)
+  app.post('/api/regression/run', (req, res) => {
+    logFunctionCall('POST /api/regression/run', {
+      mode: req.body?.mode,
+      sessionId: req.body?.sessionId,
+      policyLabel: req.body?.policyLabel,
+    });
+    const rawMode = String(req.body?.mode ?? 'suite_verified');
+    const mode: RegressionRunMode =
+      rawMode === 'candidate_policy' || rawMode === 'suite_baseline'
+        ? rawMode
+        : 'suite_verified';
+    const policyLabel = typeof req.body?.policyLabel === 'string' ? req.body.policyLabel : undefined;
+
+    let candidateControllerParams: ControllerParams | null = null;
+    let candidateRobotModel: RobotModelId | undefined;
+
+    if (mode === 'candidate_policy') {
+      if (typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()) {
+        const record = getSessionRecord(req.body.sessionId.trim());
+        if (!record) {
+          res.status(404).json({ error: 'Candidate session not found.' });
+          return;
+        }
+        const latestIter = record.state.iterations[record.state.iterations.length - 1];
+        candidateControllerParams =
+          latestIter?.controllerParams ?? record.state.sceneSpec?.controllerParams ?? null;
+        candidateRobotModel = record.state.robotModel;
+      } else if (req.body?.controllerParams && typeof req.body.controllerParams === 'object') {
+        candidateControllerParams = req.body.controllerParams as ControllerParams;
+        if (typeof req.body?.robotModel === 'string' && req.body.robotModel in APP_CONFIG.robots) {
+          candidateRobotModel = req.body.robotModel as RobotModelId;
+        }
+      }
+      if (!candidateControllerParams) {
+        res.status(400).json({
+          error: 'No compiled policy found in the active session to test against the regression suite.',
+        });
+        return;
+      }
+    }
+
+    try {
+      const run = runRegressionSuiteCi({
+        mode,
+        policyLabel,
+        candidateControllerParams,
+        candidateRobotModel,
+      });
+      res.json({ ok: true, run, suite: getRegressionSuiteSnapshot() });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to execute regression suite CI run.',
+      });
+    }
+  });
+
+  // 10e. Export Ready-to-Commit GitHub Actions YAML & pytest Suite Bundle
+  app.get('/api/regression/ci-bundle', (_req, res) => {
+    logFunctionCall('GET /api/regression/ci-bundle');
+    const artifacts = generateRegressionCiArtifacts();
+    res.json({ ok: true, artifacts });
+  });
+
+  /**
+   * Resolves a calibrated tabletop scene, verified controller, task goal, and
+   * robot model from either an active session or a saved Regression CI case.
+   */
+  const resolveTrainingExportSource = (body: Record<string, unknown>): {
+    sourceLabel: string;
+    taskGoal: string;
+    robotModel: RobotModelId;
+    sceneSpec: SceneSpec;
+    controllerParams: ControllerParams;
+  } | { error: string; status: number } => {
+    const regressionCaseId =
+      typeof body.regressionCaseId === 'string' ? body.regressionCaseId.trim() : '';
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+
+    if (regressionCaseId) {
+      const regCase = getRegressionCaseById(regressionCaseId);
+      if (!regCase) {
+        return { error: 'Selected Regression CI case not found.', status: 404 };
+      }
+      return {
+        sourceLabel: regCase.name,
+        taskGoal: regCase.taskGoal,
+        robotModel: regCase.robotModel,
+        sceneSpec: regCase.sceneSpec,
+        controllerParams: regCase.verifiedControllerParams,
+      };
+    }
+
+    if (sessionId) {
+      const record = getSessionRecord(sessionId);
+      if (!record) {
+        return { error: 'Active compiler session not found.', status: 404 };
+      }
+      if (!record.state.sceneSpec) {
+        return {
+          error:
+            'Compile a scene first (or select a saved Regression CI case) before generating training exports.',
+          status: 400,
+        };
+      }
+      const latestIter = record.state.iterations[record.state.iterations.length - 1];
+      return {
+        sourceLabel: `${record.state.sceneSpec.targetObject.name} · Active Session`,
+        taskGoal: record.state.taskGoal,
+        robotModel: record.state.robotModel,
+        sceneSpec: record.state.sceneSpec,
+        controllerParams: latestIter?.controllerParams ?? record.state.sceneSpec.controllerParams,
+      };
+    }
+
+    return {
+      error: 'Provide either sessionId or regressionCaseId to build training exports.',
+      status: 400,
+    };
+  };
+
+  /** Parses and clamps Gymnasium + MJX export options from request body. */
+  const parseGymMjxInput = (
+    body: Record<string, unknown>,
+  ): GymMjxSourceInput | { error: string; status: number } => {
+    const source = resolveTrainingExportSource(body);
+    if ('error' in source) return source;
+
+    const rawAlgo = String(body.algorithm ?? APP_CONFIG.trainingExport.gymMjx.defaultAlgo);
+    const algorithm: GymRlAlgorithm =
+      rawAlgo === 'sac' || rawAlgo === 'mjx_ppo' ? rawAlgo : 'ppo';
+
+    const rawReward = String(
+      body.rewardPreset ?? APP_CONFIG.trainingExport.gymMjx.defaultRewardPreset,
+    );
+    const rewardPreset: GymRewardPreset =
+      rawReward === 'force_safe_precision' || rawReward === 'sparse_goal'
+        ? rawReward
+        : 'dense_pick_place';
+
+    const rawDr = String(
+      body.randomizationLevel ?? APP_CONFIG.trainingExport.gymMjx.defaultRandomizationLevel,
+    );
+    const randomizationLevel: GymRandomizationLevel =
+      rawDr === 'off' || rawDr === 'aggressive' ? rawDr : 'standard';
+
+    const rawEnvs = Number(body.numEnvs ?? APP_CONFIG.trainingExport.gymMjx.defaultNumEnvs);
+    const numEnvs = Number.isFinite(rawEnvs)
+      ? Math.max(1, Math.min(8192, Math.round(rawEnvs)))
+      : APP_CONFIG.trainingExport.gymMjx.defaultNumEnvs;
+
+    const rawSteps = Number(
+      body.totalTimesteps ?? APP_CONFIG.trainingExport.gymMjx.defaultTotalTimesteps,
+    );
+    const totalTimesteps = Number.isFinite(rawSteps)
+      ? Math.max(10_000, Math.min(50_000_000, Math.round(rawSteps)))
+      : APP_CONFIG.trainingExport.gymMjx.defaultTotalTimesteps;
+
+    return {
+      ...source,
+      algorithm,
+      rewardPreset,
+      randomizationLevel,
+      numEnvs,
+      totalTimesteps,
+    };
+  };
+
+  /** Parses and clamps Synthetic LeRobot v2.1 dataset options from request body. */
+  const parseLeRobotInput = (
+    body: Record<string, unknown>,
+  ): LeRobotGeneratorInput | { error: string; status: number } => {
+    const source = resolveTrainingExportSource(body);
+    if ('error' in source) return source;
+
+    const rawEpisodes = Number(
+      body.episodeCount ?? APP_CONFIG.trainingExport.lerobot.defaultEpisodeCount,
+    );
+    const episodeCount = Number.isFinite(rawEpisodes)
+      ? Math.max(
+          1,
+          Math.min(APP_CONFIG.trainingExport.lerobot.maxEpisodeCount, Math.round(rawEpisodes)),
+        )
+      : APP_CONFIG.trainingExport.lerobot.defaultEpisodeCount;
+
+    const rawFps = Number(body.fps ?? APP_CONFIG.trainingExport.lerobot.defaultFps);
+    const fps = APP_CONFIG.trainingExport.lerobot.fpsPresets.includes(rawFps)
+      ? rawFps
+      : APP_CONFIG.trainingExport.lerobot.defaultFps;
+
+    const rawPolicy = String(
+      body.policyTarget ?? APP_CONFIG.trainingExport.lerobot.defaultPolicyTarget,
+    );
+    const policyTarget: LeRobotPolicyTarget =
+      rawPolicy === 'diffusion' || rawPolicy === 'smolvla' ? rawPolicy : 'act';
+
+    const rawSpread = String(
+      body.randomizationSpread ?? APP_CONFIG.trainingExport.lerobot.defaultRandomizationSpread,
+    );
+    const randomizationSpread: LeRobotRandomizationSpread =
+      rawSpread === 'low' || rawSpread === 'high' ? rawSpread : 'medium';
+
+    return {
+      ...source,
+      episodeCount,
+      fps,
+      policyTarget,
+      randomizationSpread,
+      includeFailedEpisodes: Boolean(body.includeFailedEpisodes),
+    };
+  };
+
+  // 11a. Preview Gymnasium + MuJoCo MJX RL Training Package
+  app.post('/api/training/gym-mjx/preview', (req, res) => {
+    logFunctionCall('POST /api/training/gym-mjx/preview', {
+      sessionId: req.body?.sessionId ?? null,
+      regressionCaseId: req.body?.regressionCaseId ?? null,
+      algorithm: req.body?.algorithm,
+    });
+    const parsed = parseGymMjxInput((req.body ?? {}) as Record<string, unknown>);
+    if ('error' in parsed) {
+      res.status(parsed.status).json({ error: parsed.error });
+      return;
+    }
+    const pkg = buildGymMjxTrainingPackage(parsed);
+    res.json({ ok: true, package: pkg });
+  });
+
+  // 11b. Download Gymnasium + MuJoCo MJX RL Training Package (.zip)
+  app.post('/api/training/gym-mjx/download', (req, res) => {
+    logFunctionCall('POST /api/training/gym-mjx/download', {
+      sessionId: req.body?.sessionId ?? null,
+      regressionCaseId: req.body?.regressionCaseId ?? null,
+      algorithm: req.body?.algorithm,
+    });
+    const parsed = parseGymMjxInput((req.body ?? {}) as Record<string, unknown>);
+    if ('error' in parsed) {
+      res.status(parsed.status).json({ error: parsed.error });
+      return;
+    }
+    const { filename, buffer } = buildGymMjxZipArchive(parsed);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.send(buffer);
+  });
+
+  // 12a. Generate & Preview Synthetic LeRobot v2.1 Episode Dataset
+  app.post('/api/training/lerobot/preview', (req, res) => {
+    logFunctionCall('POST /api/training/lerobot/preview', {
+      sessionId: req.body?.sessionId ?? null,
+      regressionCaseId: req.body?.regressionCaseId ?? null,
+      episodeCount: req.body?.episodeCount,
+      fps: req.body?.fps,
+      policyTarget: req.body?.policyTarget,
+    });
+    const parsed = parseLeRobotInput((req.body ?? {}) as Record<string, unknown>);
+    if ('error' in parsed) {
+      res.status(parsed.status).json({ error: parsed.error });
+      return;
+    }
+    const dataset = buildLeRobotDatasetPreview(parsed);
+    res.json({ ok: true, dataset });
+  });
+
+  // 12b. Download Synthetic LeRobot v2.1 Episode Dataset (.zip)
+  app.post('/api/training/lerobot/download', (req, res) => {
+    logFunctionCall('POST /api/training/lerobot/download', {
+      sessionId: req.body?.sessionId ?? null,
+      regressionCaseId: req.body?.regressionCaseId ?? null,
+      episodeCount: req.body?.episodeCount,
+      fps: req.body?.fps,
+    });
+    const parsed = parseLeRobotInput((req.body ?? {}) as Record<string, unknown>);
+    if ('error' in parsed) {
+      res.status(parsed.status).json({ error: parsed.error });
+      return;
+    }
+    const { filename, buffer } = buildLeRobotDatasetZip(parsed);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.send(buffer);
   });
 
   // Guard unmatched /api/* endpoints so they always return JSON 404 (never HTML 200)

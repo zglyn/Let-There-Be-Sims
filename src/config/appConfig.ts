@@ -168,6 +168,15 @@ export const APP_CONFIG = {
     webhookTimeoutMs: 45_000,
   },
 
+  /** Mobile QR Judge Hand-Demo capture (tap-to-select + 6s clip + gravity + audio). */
+  mobileHandDemo: {
+    defaultClipDurationSec: 6,
+    enableAudioCapture: true,
+    proxyAudioBitrateKbps: 32,
+    shortClipProxyFps: 2,
+    shortClipMaxBytes: 15 * 1024 * 1024,
+  },
+
   /** Hard per-stage timeouts and background polling intervals for Gemini 4 API calls. */
   timeouts: {
     createHandshakeMs: 90_000,
@@ -176,6 +185,45 @@ export const APP_CONFIG = {
     hydrogenStageMs: 90_000,
     neonStageMs: 180_000,
     longDecodeDispatchMs: 60_000,
+  },
+
+  /** Failure-to-Regression-Suite CI/CD persistence and verification thresholds. */
+  regressionCi: {
+    storageDirName: 'lettherebesims_regression_suite',
+    maxRunHistory: 30,
+    requiredPassRate: 1.0, // 100% of randomized envs across all saved failure cases
+    autoPromoteFailures: true,
+  },
+
+  /** Exportable RL (Gymnasium + MuJoCo MJX) and LeRobot synthetic dataset configuration. */
+  trainingExport: {
+    gymMjx: {
+      defaultAlgo: 'ppo' as const,
+      algos: ['ppo', 'sac', 'mjx_ppo'] as readonly string[],
+      defaultRewardPreset: 'dense_pick_place' as const,
+      rewardPresets: ['dense_pick_place', 'force_safe_precision', 'sparse_goal'] as readonly string[],
+      defaultRandomizationLevel: 'standard' as const,
+      randomizationLevels: ['off', 'standard', 'aggressive'] as readonly string[],
+      defaultNumEnvs: 64,
+      numEnvsPresets: [16, 64, 1024, 4096] as readonly number[],
+      defaultTotalTimesteps: 1_000_000,
+      timestepPresets: [250_000, 1_000_000, 5_000_000] as readonly number[],
+      controlHz: 50,
+      maxEpisodeSteps: 250,
+    },
+    lerobot: {
+      codebaseVersion: 'v2.1' as const,
+      defaultEpisodeCount: 25,
+      episodeCountPresets: [10, 25, 50, 100] as readonly number[],
+      maxEpisodeCount: 150,
+      defaultFps: 20,
+      fpsPresets: [10, 20, 30] as readonly number[],
+      defaultPolicyTarget: 'act' as const,
+      policyTargets: ['act', 'diffusion', 'smolvla'] as readonly string[],
+      defaultRandomizationSpread: 'medium' as const,
+      randomizationSpreads: ['low', 'medium', 'high'] as readonly string[],
+      defaultEpisodeDurationSec: 6.5,
+    },
   },
 
   /** REST & SSE endpoint builders. */
@@ -197,6 +245,14 @@ export const APP_CONFIG = {
       slot === 'secondary'
         ? `/api/sessions/${encodeURIComponent(id)}/media?slot=secondary`
         : `/api/sessions/${encodeURIComponent(id)}/media`,
+    regressionCases: '/api/regression/cases',
+    regressionCase: (caseId: string) => `/api/regression/cases/${encodeURIComponent(caseId)}`,
+    regressionRun: '/api/regression/run',
+    regressionCiBundle: '/api/regression/ci-bundle',
+    trainingGymPreview: '/api/training/gym-mjx/preview',
+    trainingGymDownload: '/api/training/gym-mjx/download',
+    trainingLerobotPreview: '/api/training/lerobot/preview',
+    trainingLerobotDownload: '/api/training/lerobot/download',
   },
 
   /** Interactive 3D Three.js camera presets (coordinates in meters, Y-up). */

@@ -133,6 +133,7 @@ export function createSession(
     rolloutDurationSec: APP_CONFIG.simulation.defaultRolloutDurationSec,
     video: null,
     secondaryVideo: null,
+    mobileSensors: null,
     webhook: {
       enabled: false,
       url: '',
@@ -200,6 +201,7 @@ export function getOrRestoreSessionRecord(sessionId: string): InternalSessionRec
     rolloutDurationSec: APP_CONFIG.simulation.defaultRolloutDurationSec,
     video: null,
     secondaryVideo: null,
+    mobileSensors: null,
     webhook: {
       enabled: false,
       url: '',
